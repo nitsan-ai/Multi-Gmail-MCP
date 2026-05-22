@@ -1,0 +1,42 @@
+{
+  "name": "multi-gmail-mcp",
+  "version": "1.0.0",
+  "description": "Production-ready Gmail MCP server with multi-account OAuth2 support, smart reply drafting, and follow-up reminders",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "auth": "node src/auth/authorize-account.js"
+  },
+  "keywords": [
+    "gmail",
+    "mcp",
+    "model-context-protocol",
+    "oauth2",
+    "googleapis",
+    "claude",
+    "cursor",
+    "ai",
+    "email",
+    "automation",
+    "multi-account"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/multi-gmail-mcp"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/multi-gmail-mcp/issues"
+  },
+  "homepage": "https://github.com/yourusername/multi-gmail-mcp#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.13.2",
+    "googleapis": "^171.4.0",
+    "zod": "^3.23.8"
+  }
+}
