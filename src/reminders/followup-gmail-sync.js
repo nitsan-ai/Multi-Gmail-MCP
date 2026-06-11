@@ -1,6 +1,5 @@
 import { createGmailClient } from "../gmail/gmail-client.js";
 import {
-  addLabelToMessage,
   getOrCreateFollowUpLabelId,
   removeLabelFromMessage
 } from "../gmail/gmail-labels.js";
@@ -17,13 +16,17 @@ export async function tagSourceMessageForFollowUp(alias, sourceMessageId) {
   try {
     const { gmail } = await createGmailClient(alias);
     const labelId = await getOrCreateFollowUpLabelId(gmail);
-    await addLabelToMessage(gmail, sourceMessageId, labelId);
-    logger.info("follow-up Gmail label applied", {
+    await gmail.users.messages.modify({
+      userId: env.DEFAULT_GMAIL_USER_ID,
+      id: sourceMessageId,
+      requestBody: { addLabelIds: [labelId], removeLabelIds: ["INBOX"] }
+    });
+    logger.info("follow-up Gmail label applied and archived", {
       alias,
       sourceMessageId,
       labelName: env.FOLLOW_UP_GMAIL_LABEL_NAME
     });
-    return { ok: true, labelName: env.FOLLOW_UP_GMAIL_LABEL_NAME };
+    return { ok: true, labelName: env.FOLLOW_UP_GMAIL_LABEL_NAME, archived: true };
   } catch (error) {
     logger.warn("follow-up Gmail label apply failed", {
       alias,

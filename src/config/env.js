@@ -21,7 +21,7 @@ const CONFIG = {
   FOLLOWUP_REMINDERS_PATH: null,
   FOLLOWUP_CHECK_INTERVAL_MS: 60_000,
   GMAIL_MCP_SCOPE_KEY: "",
-  FOLLOW_UP_GMAIL_LABEL_NAME: "Follow-up",
+  FOLLOW_UP_GMAIL_LABEL_NAME: "Multi-Gmail-MCP Follow-up",
   FOLLOW_UP_GMAIL_LABEL_ENABLED: true,
   GMAIL_REVIEW_GMAIL_LABEL_NAME: "Inbox-review",
   GMAIL_REVIEW_GMAIL_LABEL_ENABLED: false
@@ -59,7 +59,7 @@ export const env = {
   GMAIL_MCP_SCOPE_KEY: String(CONFIG.GMAIL_MCP_SCOPE_KEY).trim(),
 
   /** User label applied to the source message when a follow-up reminder is created (visible in Gmail sidebar). */
-  FOLLOW_UP_GMAIL_LABEL_NAME: String(CONFIG.FOLLOW_UP_GMAIL_LABEL_NAME).trim() || "Follow-up",
+  FOLLOW_UP_GMAIL_LABEL_NAME: String(CONFIG.FOLLOW_UP_GMAIL_LABEL_NAME).trim() || "Multi-Gmail-MCP Follow-up",
   FOLLOW_UP_GMAIL_LABEL_ENABLED: Boolean(CONFIG.FOLLOW_UP_GMAIL_LABEL_ENABLED),
 
   /**

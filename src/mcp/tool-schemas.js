@@ -1,5 +1,31 @@
 import { z } from "zod";
-import { DEFAULT_MAX_RESULTS, MAX_RESULTS_LIMIT } from "../config/constants.js";
+import {
+  DEFAULT_MAX_RESULTS,
+  DEFAULT_THREAD_LATEST_N,
+  MAX_FETCH_LIST_WITH_BODY,
+  MAX_RESULTS_LIMIT,
+  MAX_THREAD_LATEST_N
+} from "../config/constants.js";
+import { EMAIL_FORMAT_HTML, EMAIL_FORMAT_PLAIN } from "../utils/send-content.js";
+import { optionalRecipientsField, recipientsField } from "../utils/recipients.js";
+
+/** MIME type for outbound body: plain (default) or HTML in multipart/alternative. */
+export const emailFormatField = {
+  format: z
+    .enum([EMAIL_FORMAT_PLAIN, EMAIL_FORMAT_HTML])
+    .optional()
+    .default(EMAIL_FORMAT_PLAIN)
+};
+
+/** Append Gmail-style quoted parent message below reply body (default true). */
+export const quoteOriginalField = {
+  quoteOriginal: z.boolean().optional().default(true)
+};
+
+/** Append the account Gmail signature from Settings (default true). */
+export const appendSignatureField = {
+  appendSignature: z.boolean().optional().default(true)
+};
 
 export const listAccountsSchema = z.object({}).strict();
 
@@ -84,9 +110,13 @@ export const setSignerNameSchema = z
   })
   .strict();
 
-/** Fetch inbox mail (all inbox categories), summarize, draft replies. */
+/** Fetch inbox threads. Recommended: mode=list, then get_thread per selected thread. */
 export const fetchUnreadSmartDraftsSchema = z
   .object({
+    /**
+     * list = metadata-only triage (default). full = legacy batch load + auto-draft (avoid — token-heavy).
+     */
+    mode: z.enum(["list", "full"]).optional().default("list"),
     maxResults: z
       .number()
       .int()
@@ -95,6 +125,15 @@ export const fetchUnreadSmartDraftsSchema = z
       .optional()
       .default(DEFAULT_MAX_RESULTS),
     query: z.string().optional().default(""),
+    /**
+     * inbox = prepend inbox review filters (in:inbox, exclude follow-up label). raw = pass query to Gmail unchanged.
+     */
+    queryMode: z.enum(["inbox", "raw"]).optional().default("inbox"),
+    /**
+     * list mode only: fetch full plain-text body of the latest message per thread (not just Gmail snippet).
+     * Capped at MAX_FETCH_LIST_WITH_BODY threads per call. Attachments are metadata only. Prefer get_thread for one thread.
+     */
+    includeLatestBody: z.boolean().optional().default(false),
     /**
      * true = also create/update a Gmail Draft per message. Default false — review drafts in chat (and optional .md) first; use send to send; set true only if you want copies in Gmail Drafts.
      */
@@ -108,33 +147,96 @@ export const fetchUnreadSmartDraftsSchema = z
   })
   .strict();
 
-/** Send an approved smart-reply and mark the source message as read. Use messageId from fetch. */
-export const sendSmartReplySchema = z
+/**
+ * Send approved reply. Plain z.object for MCP registration.
+ * New outbound / campaigns: use sendNewEmailBaseSchema (`send_new`).
+ */
+export const sendSmartReplyBaseSchema = z
   .object({
+    /** Source message to reply to — marks read and threads the send. */
     messageId: z.string().min(1),
-    to: z.union([z.string().email(), z.array(z.string().email())]),
+    to: recipientsField(),
     subject: z.string().min(1),
-    body: z.string().min(1),
-    cc: z.union([z.string().email(), z.array(z.string().email())]).optional(),
-    bcc: z.union([z.string().email(), z.array(z.string().email())]).optional(),
+    /** Message content. With format=text/html this is the HTML part (plain fallback auto-generated). */
+    body: z.string().min(1).optional(),
+    /** @deprecated Prefer body + format=text/html. Legacy HTML part (multipart/alternative). */
+    html: z.string().min(1).optional(),
+    ...emailFormatField,
+    cc: optionalRecipientsField(),
+    bcc: optionalRecipientsField(),
+    ...quoteOriginalField,
+    ...appendSignatureField,
     ...accountAliasField,
     ...chatScopeField
   })
   .strict();
 
-/** Save/update a Gmail draft reply for a thread without sending. */
-export const setDraftReplySchema = z
+function requireBodyOrHtml(value, ctx, htmlKeys = ["html"]) {
+  const hasBody = typeof value.body === "string" && value.body.trim().length > 0;
+  const hasHtml = htmlKeys.some(
+    (key) => typeof value[key] === "string" && value[key].trim().length > 0
+  );
+  if (!hasBody && !hasHtml) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["body"],
+      message:
+        "Provide body (use format text/html for HTML), and/or legacy html / htmlBody."
+    });
+  }
+}
+
+export const sendSmartReplySchema = sendSmartReplyBaseSchema.superRefine((value, ctx) => {
+  requireBodyOrHtml(value, ctx, ["html"]);
+});
+
+/**
+ * New outbound email (new Gmail thread). No messageId — for campaigns and cold outreach.
+ * Plain z.object() for MCP registration; cross-field rules in sendNewEmailSchema.
+ */
+export const sendNewEmailBaseSchema = z
   .object({
-    messageId: z.string().min(1),
-    to: z.union([z.string().email(), z.array(z.string().email())]),
+    to: recipientsField(),
+    /** Optional — append to an existing thread (e.g. campaign email 2). From prior send_new `threadId`. */
+    threadId: z.string().min(1).optional(),
     subject: z.string().min(1),
-    body: z.string().min(1),
-    cc: z.union([z.string().email(), z.array(z.string().email())]).optional(),
-    bcc: z.union([z.string().email(), z.array(z.string().email())]).optional(),
+    /** Message content. With format=text/html this is the HTML part (plain fallback auto-generated). */
+    body: z.string().min(1).optional(),
+    /** @deprecated Prefer body + format=text/html. Legacy HTML body for campaigns. */
+    htmlBody: z.string().min(1).optional(),
+    ...emailFormatField,
+    cc: optionalRecipientsField(),
+    bcc: optionalRecipientsField(),
     ...accountAliasField,
     ...chatScopeField
   })
   .strict();
+
+export const sendNewEmailSchema = sendNewEmailBaseSchema.superRefine((value, ctx) => {
+  requireBodyOrHtml(value, ctx, ["htmlBody"]);
+});
+
+/** Save/update a Gmail draft reply for a thread without sending. */
+export const setDraftReplySchema = z
+  .object({
+    messageId: z.string().min(1),
+    to: recipientsField(),
+    subject: z.string().min(1),
+    body: z.string().min(1).optional(),
+    html: z.string().min(1).optional(),
+    ...emailFormatField,
+    cc: optionalRecipientsField(),
+    bcc: optionalRecipientsField(),
+    ...quoteOriginalField,
+    ...appendSignatureField,
+    ...accountAliasField,
+    ...chatScopeField
+  })
+  .strict();
+
+export const setDraftReplyValidatedSchema = setDraftReplySchema.superRefine((value, ctx) => {
+  requireBodyOrHtml(value, ctx, ["html"]);
+});
 
 /**
  * Plain z.object() registered with MCP's registerTool — the SDK normalises only z.object()
@@ -203,6 +305,40 @@ export const followUpCheckDueSchema = z
   })
   .strict();
 
+export const getThreadSchema = z
+  .object({
+    threadId: z.string().min(1),
+    /**
+     * metadata = headers/dates only (no bodies).
+     * latest = first message + latest N messages (with omission marker).
+     * full = complete plain-text transcript (default).
+     */
+    format: z.enum(["metadata", "latest", "full"]).optional().default("full"),
+    /** Used when format=latest; how many trailing messages to include after the first. */
+    latestN: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_THREAD_LATEST_N)
+      .optional()
+      .default(DEFAULT_THREAD_LATEST_N),
+    /** true = remove quoted reply history (use when drafting in multi-message threads). false = full plain-text body (default). */
+    stripped: z.boolean().optional().default(false),
+    /** true = include `rawText` alongside stripped `text` (when stripped=true). Ignored when format=metadata. */
+    includeRaw: z.boolean().optional().default(false),
+    ...accountAliasField,
+    ...chatScopeField
+  })
+  .strict();
+
+export const archiveThreadSchema = z
+  .object({
+    threadId: z.string().min(1),
+    ...accountAliasField,
+    ...chatScopeField
+  })
+  .strict();
+
 /** List Gmail Drafts folder. */
 export const fetchDraftsSchema = z
   .object({
@@ -221,15 +357,67 @@ export const fetchSentSchema = z
   })
   .strict();
 
+/** Remove stored follow-up reminders (local store only; optional Gmail label removal). */
+export const followUpCleanupBaseSchema = z
+  .object({
+    reminderIds: z.array(z.string().min(1)).min(1).optional(),
+    messageId: z.string().min(1).optional(),
+    messageHeaderId: z.string().min(1).optional(),
+    sourceThreadId: z.string().min(1).optional(),
+    followUpChainId: z.string().min(1).optional(),
+    /** When deleting by reminderIds, also remove all reminders in the same followUpChainId. */
+    cancelChain: z.boolean().optional().default(false),
+    /** Delete every reminder for the active account. Requires confirm: true. */
+    deleteAll: z.boolean().optional().default(false),
+    confirm: z.boolean().optional().default(false),
+    statuses: z
+      .array(z.enum(["pending", "due", "waiting", "sent", "resolved_by_reply"]))
+      .optional(),
+    /** Remove Multi-Gmail-MCP Follow-up label when no reminders remain for a source message. Default true. */
+    removeGmailLabel: z.boolean().optional().default(true),
+    ...accountAliasField,
+    ...chatScopeField
+  })
+  .strict();
+
+export const followUpCleanupSchema = followUpCleanupBaseSchema.superRefine((value, ctx) => {
+  const hasIds = Array.isArray(value.reminderIds) && value.reminderIds.length > 0;
+  const hasMessage = Boolean(value.messageId?.trim());
+  const hasMessageHeader = Boolean(value.messageHeaderId?.trim());
+  const hasThread = Boolean(value.sourceThreadId?.trim());
+  const hasChain = Boolean(value.followUpChainId?.trim());
+  const hasDeleteAll = value.deleteAll === true;
+
+  if (!hasIds && !hasMessage && !hasMessageHeader && !hasThread && !hasChain && !hasDeleteAll) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["reminderIds"],
+      message:
+        "Provide reminderIds, messageId, messageHeaderId, sourceThreadId, followUpChainId, or deleteAll with confirm."
+    });
+  }
+  if (hasDeleteAll && value.confirm !== true) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["confirm"],
+      message: "deleteAll requires confirm: true."
+    });
+  }
+});
+
 /** Send a stored follow-up after explicit user approval. Overrides to/subject/body are optional if the draft is complete. */
 export const followUpSendSchema = z
   .object({
     reminderId: z.string().min(1),
-    to: z.union([z.string().email(), z.array(z.string().email())]).optional(),
+    to: optionalRecipientsField(),
     subject: z.string().optional(),
     body: z.string().optional(),
-    cc: z.union([z.string().email(), z.array(z.string().email())]).optional(),
-    bcc: z.union([z.string().email(), z.array(z.string().email())]).optional(),
+    html: z.string().min(1).optional(),
+    ...emailFormatField,
+    cc: optionalRecipientsField(),
+    bcc: optionalRecipientsField(),
+    ...quoteOriginalField,
+    ...appendSignatureField,
     ...accountAliasField,
     ...chatScopeField
   })

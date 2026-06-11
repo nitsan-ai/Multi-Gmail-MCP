@@ -119,3 +119,24 @@ export async function listDuePendingFollowUps(now = new Date()) {
     return Number.isFinite(reminderDueAt) && reminderDueAt <= dueAt;
   });
 }
+
+/**
+ * Remove reminders matching `predicate`. Returns removed records (newest-first stable order).
+ */
+export async function deleteFollowUpReminders(predicate) {
+  return queueMutation(async () => {
+    const store = await readStoreFile();
+    const removed = [];
+    store.reminders = store.reminders.filter((reminder) => {
+      if (predicate(reminder)) {
+        removed.push(reminder);
+        return false;
+      }
+      return true;
+    });
+    if (removed.length > 0) {
+      await writeStoreFile(store);
+    }
+    return removed;
+  });
+}

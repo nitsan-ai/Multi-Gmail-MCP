@@ -1,34 +1,26 @@
+import { htmlToPlainBody, looksLikeHtml, stripHtmlToText } from "./html-text.js";
+import { decodeMimeHeaderValue } from "./mime-headers.js";
+
+export { stripHtmlToText, looksLikeHtml, htmlToPlainBody } from "./html-text.js";
+
 function getHeader(headers = [], name) {
   const match = headers.find((header) => header.name?.toLowerCase() === name.toLowerCase());
-  return match?.value ?? "";
+  const value = match?.value ?? "";
+  return decodeMimeHeaderValue(value);
 }
 
-/**
- * Strip HTML tags so bodyText is always plain text (BUG-3).
- * Handles common entities, removes <style>/<script> blocks, and converts
- * <br> / </p> to newlines to preserve paragraph structure.
- */
-export function stripHtmlToText(html) {
-  return String(html || "")
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, " ")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(?:p|div|li|tr|h[1-6])\b[^>]*>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+/** Extract bare email from a From/To header value. */
+export function normalizeEmailAddress(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  const bracketMatch = raw.match(/<([^>]+)>/);
+  if (bracketMatch?.[1]) {
+    return bracketMatch[1].trim();
+  }
+  const emailMatch = raw.match(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/i);
+  return emailMatch ? emailMatch[0].toLowerCase() : raw;
 }
 
-function looksLikeHtml(text) {
-  return /<[a-z][\s\S]*>/i.test(String(text).trimStart().slice(0, 300));
-}
+export { extractNewReplyContent, stripQuotedReplyContent } from "./email-body-stripper.js";
 
 function extractPlainText(parts = []) {
   for (const part of parts) {
@@ -46,7 +38,7 @@ function extractPlainText(parts = []) {
 function extractHtmlText(parts = []) {
   for (const part of parts) {
     if (part.mimeType === "text/html" && part.body?.data) {
-      return stripHtmlToText(Buffer.from(part.body.data, "base64").toString("utf8"));
+      return htmlToPlainBody(Buffer.from(part.body.data, "base64").toString("utf8"));
     }
     if (part.parts?.length) {
       const nested = extractHtmlText(part.parts);
@@ -54,6 +46,37 @@ function extractHtmlText(parts = []) {
     }
   }
   return "";
+}
+
+function extractRawHtml(parts = []) {
+  for (const part of parts) {
+    if (part.mimeType === "text/html" && part.body?.data) {
+      return Buffer.from(part.body.data, "base64").toString("utf8");
+    }
+    if (part.parts?.length) {
+      const nested = extractRawHtml(part.parts);
+      if (nested) return nested;
+    }
+  }
+  return "";
+}
+
+/** Original message bodies for reply quoting (not quote-stripped). */
+export function extractRawMessageBodies(message) {
+  const payload = message.payload ?? {};
+  let rawBodyPlain = extractPlainText(payload.parts ?? []);
+  if (!rawBodyPlain && payload.body?.data) {
+    const decoded = Buffer.from(payload.body.data, "base64").toString("utf8");
+    rawBodyPlain = looksLikeHtml(decoded) ? "" : decoded;
+  }
+
+  let rawBodyHtml = extractRawHtml(payload.parts ?? []);
+  if (!rawBodyHtml && payload.body?.data) {
+    const decoded = Buffer.from(payload.body.data, "base64").toString("utf8");
+    if (looksLikeHtml(decoded)) rawBodyHtml = decoded;
+  }
+
+  return { rawBodyPlain: rawBodyPlain || "", rawBodyHtml: rawBodyHtml || "" };
 }
 
 export function formatMessageSummary(message) {
@@ -66,6 +89,7 @@ export function formatMessageSummary(message) {
     snippet: message.snippet ?? "",
     from: getHeader(headers, "From"),
     to: getHeader(headers, "To"),
+    cc: getHeader(headers, "Cc"),
     subject: getHeader(headers, "Subject"),
     date: getHeader(headers, "Date"),
     internalDate: message.internalDate ? new Date(Number(message.internalDate)).toISOString() : null
@@ -77,22 +101,25 @@ export function formatFullMessage(message) {
   const headers = payload.headers ?? [];
 
   // Prefer text/plain — never pass raw HTML into bodyText (BUG-3).
-  // Priority: text/plain from parts → plain top-level body → stripped HTML from parts
-  //           → stripped top-level HTML body.
+  // HTML parts: planer (talon) quote removal, then plaintext conversion.
   let bodyText = extractPlainText(payload.parts ?? []);
   if (!bodyText) {
     if (payload.body?.data) {
       const decoded = Buffer.from(payload.body.data, "base64").toString("utf8");
-      bodyText = looksLikeHtml(decoded) ? stripHtmlToText(decoded) : decoded;
+      bodyText = looksLikeHtml(decoded) ? htmlToPlainBody(decoded) : decoded;
     } else {
       bodyText = extractHtmlText(payload.parts ?? []);
     }
   }
 
+  const { rawBodyPlain, rawBodyHtml } = extractRawMessageBodies(message);
+
   return {
     ...formatMessageSummary(message),
     labelIds: message.labelIds ?? [],
     bodyText,
+    rawBodyPlain: rawBodyPlain || bodyText,
+    rawBodyHtml,
     listUnsubscribeHeader: getHeader(headers, "List-Unsubscribe"),
     replyToHeader: getHeader(headers, "Reply-To"),
     messageHeaderId: getHeader(headers, "Message-ID") || getHeader(headers, "Message-Id"),

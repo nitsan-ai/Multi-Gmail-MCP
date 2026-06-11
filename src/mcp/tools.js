@@ -6,6 +6,7 @@ import {
   listSessionBindings
 } from "../auth/account-manager.js";
 import { env } from "../config/env.js";
+import { inboxWorkflowMarkdown, INBOX_WORKFLOW_POLICY } from "../config/inbox-workflow.js";
 import {
   sendEmail,
   setReplyDraft,
@@ -14,12 +15,16 @@ import {
   removeInboxReviewGmailLabel,
   ensureMcpGmailLabelsForAccount,
   fetchGmailDrafts,
-  fetchGmailSent
+  fetchGmailSent,
+  getThread,
+  archiveThread
 } from "../gmail/gmail-service.js";
 import {
   createFollowUpReminder,
+  deleteFollowUpReminders,
   getFollowUpReminder,
   listDuePendingFollowUps,
+  listFollowUpReminders,
   updateFollowUpReminder
 } from "../reminders/reminder-store.js";
 import {
@@ -31,26 +36,36 @@ import {
   refreshDueFollowUpReminder,
   sendFollowUpReminder
 } from "../reminders/followup-service.js";
+import { randomUUID } from "crypto";
 import { promises as fs } from "fs";
 import path from "path";
 import { AppError, errorResponse, okResponse } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import { resolveOutboundEmailParts } from "../utils/send-content.js";
 import {
   helpOnboardingSchema,
   ensureMcpGmailLabelsSchema,
+  getThreadSchema,
+  archiveThreadSchema,
   completeConnectAccountSchema,
   connectAccountSchema,
   fetchUnreadSmartDraftsSchema,
   fetchDraftsSchema,
   fetchSentSchema,
   followUpCheckDueSchema,
+  followUpCleanupBaseSchema,
+  followUpCleanupSchema,
   followUpTriggerBaseSchema,
   followUpTriggerSchema,
   followUpSendSchema,
   listAccountsSchema,
   runSetupDiagnosticsSchema,
+  sendSmartReplyBaseSchema,
   sendSmartReplySchema,
+  sendNewEmailBaseSchema,
+  sendNewEmailSchema,
   setDraftReplySchema,
+  setDraftReplyValidatedSchema,
   setResponseModeSchema,
   setSignerNameSchema,
   workspaceStatusSchema
@@ -82,12 +97,106 @@ function getResponseMode(scopeKey) {
   return sessionResponseModes.get(scopeKey) || "standard";
 }
 
+function buildThreadTranscriptMarkdown(data) {
+  const format = data.format || "full";
+  const lines = [
+    `# Thread: ${data.subject || "(no subject)"}`,
+    "",
+    `format: ${format}`,
+    format === "latest" && data.latestN != null ? `latestN: ${data.latestN}` : null,
+    `threadId: ${data.threadId || "—"}`,
+    `messages: ${data.messageCount ?? 0}`,
+    `latestMessageId: ${data.latestMessageId || "—"}`,
+    data.participants?.from ? `participants.from: ${data.participants.from}` : null,
+    format === "metadata" ? "bodies: omitted (metadata only)" : null,
+    format !== "metadata" && data.stripped === false ? "bodies: raw (stripped=false)" : null,
+    format !== "metadata" && data.includeRaw ? "bodies: stripped text + rawText per message" : null,
+    ""
+  ];
+
+  if (Array.isArray(data.messages) && data.messages.length > 0) {
+    let section = 0;
+    for (const message of data.messages) {
+      if (message.marker) {
+        lines.push(message.marker, "");
+        continue;
+      }
+      section++;
+      lines.push(
+        `## ${section}. ${message.direction || "—"}`,
+        `messageId: ${message.messageId || "—"}`,
+        `from: ${message.from || "—"}`,
+        `to: ${message.to || "—"}`,
+        `date: ${message.date || "—"}`
+      );
+      if (format !== "metadata") {
+        lines.push("", message.text || "_(no content)_");
+        if (message.rawText && data.includeRaw && data.stripped !== false) {
+          lines.push("", "_rawText available in structuredContent_");
+        }
+      }
+      lines.push("", "---", "");
+    }
+  } else {
+    lines.push("_No messages in this thread._", "");
+  }
+
+  return lines.filter(Boolean).join("\n");
+}
+
+function getThreadToolResult(payload) {
+  if (!payload.ok || !payload.data) {
+    return toolResult(payload);
+  }
+  return {
+    content: [{ type: "text", text: buildThreadTranscriptMarkdown(payload.data) }],
+    structuredContent: payload
+  };
+}
+
+function buildListInboxMarkdown(data) {
+  const lines = [
+    "# Inbox threads (list)",
+    "",
+    `Account: ${data.activeEmail ?? "—"}`,
+    `Threads: ${data.threadCount ?? data.inboxThreadCount ?? 0}`,
+    "Metadata only — snippets are **not** full emails. Call `get_thread` per thread and show `message.text` verbatim when the user needs to read mail.",
+    "",
+    inboxWorkflowMarkdown({ heading: "### Next steps" })
+  ];
+
+  if (Array.isArray(data.items) && data.items.length > 0) {
+    for (const [index, item] of data.items.entries()) {
+      const from = item.participants?.from || item.from || "—";
+      lines.push(
+        `${index + 1}) ${item.subject || "(no subject)"}`,
+        `   from: ${from}`,
+        `   direction: ${item.lastMessageDirection || "—"}`,
+        `   date: ${item.lastMessageDate || "—"}`,
+        `   messages: ${item.messageCount ?? "—"}`,
+        `   threadId: ${item.threadId || "—"}`,
+        `   latestMessageId: ${item.latestMessageId || "—"}`,
+        item.snippet ? `   snippet: ${item.snippet}` : null,
+        ""
+      );
+    }
+  } else {
+    lines.push("No inbox threads in this batch.", "");
+  }
+
+  return lines.filter(Boolean).join("\n");
+}
+
 function buildCompactInboxMarkdown(data) {
+  if (data.mode === "list") {
+    return buildListInboxMarkdown(data);
+  }
+
   const lines = [
     "# Inbox review (compact)",
     "",
     `Account: ${data.activeEmail ?? "—"}`,
-    `Inbox messages in batch: ${data.inboxCount ?? data.unreadCount ?? 0}`,
+    `Inbox threads in batch: ${data.threadCount ?? data.inboxThreadCount ?? data.inboxCount ?? 0}`,
     "Safety: nothing is sent automatically",
     ""
   ];
@@ -96,8 +205,9 @@ function buildCompactInboxMarkdown(data) {
     for (const [index, item] of data.items.entries()) {
       lines.push(
         `${index + 1}) ${item.subject || "(no subject)"}`,
-        `   from: ${item.from || "—"}`,
-        `   messageId: ${item.messageId}`,
+        `   from: ${item.from || item.participants?.from || "—"}`,
+        `   threadId: ${item.threadId || "—"}`,
+        `   messageId: ${item.messageId || item.latestMessageId || "—"}`,
         ""
       );
     }
@@ -107,7 +217,7 @@ function buildCompactInboxMarkdown(data) {
       ""
     );
   } else {
-    lines.push("No inbox messages in this batch.", "");
+    lines.push("No inbox threads in this batch.", "");
   }
 
   return lines.join("\n");
@@ -124,11 +234,14 @@ function buildSmartAssistantChatMarkdown(data) {
   const savedReviewMd = data.markdownSaved && data.markdownFile;
 
   const lines = [
-    "# Inbox review",
+    "# Inbox review (legacy batch mode)",
     "",
-    "> **Review drafts** — Every message below has a proposed reply in this run. **Do not send** until the user confirms each one. When generating or editing drafts, avoid reusing previously addressed content from the thread history and generate a fresh, context-aware response instead. When they approve, call **`send`** to deliver to the recipient and mark the original as read. Show **all** items; the user chooses send / edit / skip **per** message. Raise **`maxResults`** if they want more than one batch.",
+    data.workflowWarning
+      ? `> **${data.workflowWarning}** Prefer \`fetch\` mode=list, then \`get_thread\` one thread at a time for future runs.`
+      : null,
+    "> **Review drafts** — Every inbox thread below has a proposed reply in this run. **Do not send** until the user confirms each one. Drafting already used the full thread context. When generating or editing drafts, avoid reusing previously addressed content from the thread history and generate a fresh, context-aware response instead. When they approve, call **`send`** to deliver to the recipient and mark the original as read. Show **all** items; the user chooses send / edit / skip **per** thread.",
     ""
-  ];
+  ].filter(Boolean);
 
   if (savedReviewMd) {
     if (mdNorm.includes("knowledge-base/") || mdNorm.includes("T3Planet-Cowork/")) {
@@ -152,8 +265,8 @@ function buildSmartAssistantChatMarkdown(data) {
 
   lines.push(
     `**Connected account:** ${data.activeEmail ?? "—"}`,
-    `**Inbox messages in this batch:** ${data.inboxCount ?? data.unreadCount ?? 0}`,
-    `**Ready to send:** only after explicit approval per message (nothing sent automatically)`,
+    `**Inbox threads in this batch:** ${data.threadCount ?? data.inboxThreadCount ?? data.inboxCount ?? 0}`,
+    `**Ready to send:** only after explicit approval per thread (nothing sent automatically)`,
     `**Optional export:** ${fileLine}`,
     `**Gmail filter:** \`${data.gmailListQuery ?? ""}\``,
     ""
@@ -173,7 +286,9 @@ function buildSmartAssistantChatMarkdown(data) {
       const sub = item.subject || "(no subject)";
       lines.push(`## ${i + 1}. ${sub}`);
       lines.push(`- **From:** ${item.from || "—"}`);
+      lines.push(`- **threadId:** \`${item.threadId || "—"}\``);
       lines.push(`- **messageId:** \`${item.messageId}\``);
+      lines.push(`- **Thread messages:** ${item.threadMessageCount || item.threadContext?.messageCount || 0}`);
       lines.push(`- **Intent:** ${item.intentType} — ${item.intentDetail}`);
       if (item.mailSummary) lines.push(`- **Summary:** ${item.mailSummary}`);
       if (item.senderGoal) lines.push(`- **Sender Goal:** ${item.senderGoal}`);
@@ -203,15 +318,15 @@ function buildSmartAssistantChatMarkdown(data) {
 
     lines.push(
       "**For each draft, reply with your choice:**",
-      "- **send** — sends the draft and marks the email as read",
+      "- **send** — sends the draft reply for that thread and marks the source email as read",
       "- **edit** — paste your revised text and confirm",
       "- **cancel** — discard this draft",
       "",
-      "> IMPORTANT: Nothing is sent until you explicitly say **send** for a specific email.",
+      "> IMPORTANT: Nothing is sent until you explicitly say **send** for a specific thread/email.",
       ""
     );
   } else {
-    lines.push(data.draftsMarkdown || "_No inbox messages in this run._", "");
+    lines.push(data.draftsMarkdown || "_No inbox threads in this run._", "");
   }
 
   return lines.join("\n");
@@ -222,9 +337,11 @@ function smartAssistantFetchResult(payload) {
     return toolResult(payload);
   }
   const chatMarkdown =
-    payload.data.responseMode === "compact"
-      ? buildCompactInboxMarkdown(payload.data)
-      : buildSmartAssistantChatMarkdown(payload.data);
+    payload.data.mode === "list"
+      ? buildListInboxMarkdown(payload.data)
+      : payload.data.responseMode === "compact"
+        ? buildCompactInboxMarkdown(payload.data)
+        : buildSmartAssistantChatMarkdown(payload.data);
   return {
     content: [{ type: "text", text: chatMarkdown }],
     structuredContent: payload
@@ -236,10 +353,17 @@ function formatFollowUpItemMarkdown(item, index) {
     `## ${index + 1}. ${item.sourceSubject || item.draft?.subject || "(no subject)"}`,
     `- **Reminder ID:** \`${item.id}\``,
     `- **Connected account:** ${item.activeEmail ?? "—"} (\`${item.alias ?? "—"}\`)`,
+    `- **Thread ID:** \`${item.sourceThreadId || item.threadContext?.threadId || "—"}\``,
     `- **From:** ${item.sourceFrom || "—"}`,
-    `- **Due:** ${item.dueAt || "—"}`,
+    `- **Thread messages:** ${item.threadContext?.messageCount || 0}`,
+    `- **Due:** ${
+      item.status === "waiting"
+        ? `after follow-up #${(item.followUpSequence ?? 0)} is sent (+${item.reminderDays} day(s))`
+        : item.dueAt || "—"
+    }`,
     `- **Status:** ${item.status || "pending"}`,
     `- **Summary:** ${item.summary || "—"}`,
+    item.latestExternalDate ? `- **Latest external reply:** ${item.latestExternalDate}` : null,
     `- **Gmail Draft:** ${
       item.draft?.gmailDraftId
         ? `\`${item.draft.gmailDraftId}\` (${item.draft.gmailDraftAction || "saved"})`
@@ -256,11 +380,15 @@ function formatFollowUpItemMarkdown(item, index) {
     item.draft?.body || "",
     "```",
     "",
+    item.threadContext?.lastMessage?.bodyText
+      ? `**Latest thread message preview:** ${String(item.threadContext.lastMessage.bodyText).replace(/\s+/g, " ").trim().slice(0, 280)}`
+      : null,
+    "",
     "> Nothing is sent automatically. Only call `followup_send` when the user explicitly says `send`.",
     ""
   ];
 
-  return lines.join("\n");
+  return lines.filter(Boolean).join("\n");
 }
 
 function followUpResult(payload) {
@@ -419,9 +547,10 @@ function buildOnboardingMarkdown() {
     "2. Run `connect` (example: `Connect you@example.com personal`).",
     "3. Run `connect_finish` right after browser approval.",
     "4. Run `set_signer` with your preferred signature name.",
-    "5. Run `fetch` and review drafts.",
-    "6. Send only approved drafts with `send`.",
+    '5. Run `fetch` with `mode="list"` to scan inbox metadata.',
+    "6. For each thread that needs a reply, run `get_thread` once, draft, then `send` only after approval.",
     "",
+    inboxWorkflowMarkdown(),
     "Safety:",
     "- Nothing is sent automatically.",
     "- You must explicitly approve each send action.",
@@ -429,6 +558,7 @@ function buildOnboardingMarkdown() {
     "Optional:",
     "- Run `set_mode` with `compact` for shorter responses.",
     "- Run `diagnostics` if setup/auth feels broken.",
+    "- `fetch` with `mode=full` is legacy batch mode — avoid for normal inbox review.",
     ""
   ].join("\n");
 }
@@ -491,10 +621,13 @@ function addBusinessDaysUtc(startDate, businessDays) {
 }
 
 function resolveReminderDueAt(days, options = {}) {
-  const now = new Date();
+  const anchor =
+    options.baseDate instanceof Date && !Number.isNaN(options.baseDate.getTime())
+      ? options.baseDate
+      : new Date();
   const base = options.businessDaysOnly
-    ? addBusinessDaysUtc(now, days)
-    : new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+    ? addBusinessDaysUtc(anchor, days)
+    : new Date(anchor.getTime() + days * 24 * 60 * 60 * 1000);
   const weekdayIndex =
     typeof options.dueWeekday === "string"
       ? WEEKDAY_TO_INDEX[options.dueWeekday.toLowerCase()]
@@ -511,11 +644,81 @@ function resolveReminderDueAt(days, options = {}) {
   return dueDate.toISOString();
 }
 
+async function reschedulePendingFollowUpsForThread(alias, threadId) {
+  if (!threadId) return;
+  const all = await listFollowUpReminders();
+  const matches = all.filter(
+    (r) => r.alias === alias && r.sourceThreadId === threadId && ["pending", "due"].includes(r.status)
+  );
+  for (const reminder of matches) {
+    const days = reminder.reminderDays;
+    if (!Number.isFinite(days) || days <= 0) continue;
+    const newDueAt = resolveReminderDueAt(days, reminder.scheduleRule || {});
+    await updateFollowUpReminder(reminder.id, { dueAt: newDueAt, status: "pending" });
+    logger.info("follow-up rescheduled after reply", { reminderId: reminder.id, newDueAt });
+  }
+}
+
+/** After follow-up N is sent, schedule follow-up N+1 from sentAt + its reminderDays. */
+async function activateNextFollowUpInChain(sentReminder) {
+  if (!sentReminder?.followUpChainId || sentReminder.followUpSequence === undefined) {
+    return null;
+  }
+  const nextSequence = sentReminder.followUpSequence + 1;
+  const all = await listFollowUpReminders();
+  const next = all.find(
+    (r) =>
+      r.followUpChainId === sentReminder.followUpChainId &&
+      r.followUpSequence === nextSequence &&
+      r.status === "waiting"
+  );
+  if (!next) return null;
+
+  const sentAt = sentReminder.sentAt ? new Date(sentReminder.sentAt) : new Date();
+  const scheduleRule = next.scheduleRule || {};
+  const newDueAt = resolveReminderDueAt(next.reminderDays, {
+    ...scheduleRule,
+    baseDate: sentAt
+  });
+  const activated = await updateFollowUpReminder(next.id, {
+    status: "pending",
+    dueAt: newDueAt
+  });
+  logger.info("follow-up chain: next reminder activated", {
+    chainId: sentReminder.followUpChainId,
+    previousReminderId: sentReminder.id,
+    nextReminderId: next.id,
+    newDueAt
+  });
+  return activated;
+}
+
 function parseFollowUpPattern(pattern) {
   const text = String(pattern || "").trim();
   if (!text) return [];
   const matches = text.match(/\d+/g) || [];
   return Array.from(new Set(matches.map((item) => Number.parseInt(item, 10)).filter(Number.isFinite))).sort((a, b) => a - b);
+}
+
+function normalizeMessageHeaderId(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+async function listEditableFollowUpsForThread(alias, sourceThreadId) {
+  const all = await listFollowUpReminders();
+  return all
+    .filter(
+      (reminder) =>
+        reminder.alias === alias &&
+        reminder.sourceThreadId === sourceThreadId &&
+        ["pending", "due", "waiting"].includes(reminder.status)
+    )
+    .sort((left, right) => {
+      const leftSeq = Number.isInteger(left.followUpSequence) ? left.followUpSequence : 0;
+      const rightSeq = Number.isInteger(right.followUpSequence) ? right.followUpSequence : 0;
+      if (leftSeq !== rightSeq) return leftSeq - rightSeq;
+      return String(left.createdAt || "").localeCompare(String(right.createdAt || ""));
+    });
 }
 
 async function handleFetchUnreadSmartDrafts(args, extra) {
@@ -527,6 +730,8 @@ async function handleFetchUnreadSmartDrafts(args, extra) {
     const payload = omitRoutingFields(input);
 
     logger.info("fetch", {
+      mode: payload.mode,
+      queryMode: payload.queryMode,
       maxResults: payload.maxResults,
       query: payload.query,
       saveGmailDrafts: payload.saveGmailDrafts,
@@ -538,9 +743,11 @@ async function handleFetchUnreadSmartDrafts(args, extra) {
       alias: binding.alias,
       maxResults: payload.maxResults,
       query: payload.query,
-      writeMarkdownFile: payload.writeMarkdownFile,
+      queryMode: payload.queryMode,
+      mode: payload.mode,
+      writeMarkdownFile: payload.mode === "full" ? payload.writeMarkdownFile : false,
       signerName,
-      saveGmailDrafts: payload.saveGmailDrafts
+      saveGmailDrafts: payload.mode === "full" ? payload.saveGmailDrafts : false
     });
 
     const merged = { ...data, writeMarkdownFile: payload.writeMarkdownFile };
@@ -563,92 +770,159 @@ async function handleFetchUnreadSmartDrafts(args, extra) {
   }
 }
 
+async function executeApprovedSend(binding, payload, { sourceMessageId, action = "send" }) {
+  const isReply = Boolean(sourceMessageId);
+  const continuesThread = Boolean(payload.threadId?.trim() && !isReply);
+  const parts = resolveOutboundEmailParts({
+    body: payload.body,
+    html: payload.html,
+    htmlBody: payload.htmlBody,
+    format: payload.format
+  });
+
+  logger.info(action, {
+    messageId: sourceMessageId ?? null,
+    isReply,
+    to: payload.to,
+    subject: payload.subject,
+    format: parts.format,
+    hasHtml: Boolean(parts.html)
+  });
+
+  const sendResult = await sendEmail({
+    alias: binding.alias,
+    to: payload.to,
+    subject: payload.subject,
+    body: parts.body,
+    cc: payload.cc,
+    bcc: payload.bcc,
+    html: parts.html,
+    sourceMessageId,
+    threadId: payload.threadId,
+    quoteOriginal: payload.quoteOriginal,
+    appendSignature: payload.appendSignature
+  });
+
+  let markResult = null;
+  let reviewLabelRemoved = { removed: false, labelName: null };
+  if (isReply) {
+    markResult = await markAsRead({
+      alias: binding.alias,
+      messageId: sourceMessageId
+    });
+    reviewLabelRemoved = await removeInboxReviewGmailLabel({
+      alias: binding.alias,
+      messageId: sourceMessageId
+    });
+    await reschedulePendingFollowUpsForThread(binding.alias, sendResult.threadId);
+  }
+
+  logger.info(`${action} complete`, {
+    sentId: sendResult.id,
+    threadId: sendResult.threadId,
+    markedRead: markResult?.messageId ?? null,
+    isReply
+  });
+
+  const to = Array.isArray(payload.to) ? payload.to.join(", ") : payload.to;
+  let summary;
+  if (isReply) {
+    let tail = "";
+    if (reviewLabelRemoved.removed) {
+      tail += `, inbox-review label "${reviewLabelRemoved.labelName}" removed from source`;
+    }
+    if (sendResult.deletedDraft) {
+      tail += ", and the matching Gmail draft was removed";
+    } else if (sendResult.deletedDraftError) {
+      tail += `, but draft cleanup failed: ${sendResult.deletedDraftError}`;
+    }
+    summary = `Email sent to ${to}, source message marked as read${tail}.`;
+  } else if (continuesThread) {
+    summary = `Email sent to ${to} in existing thread ${sendResult.threadId}.`;
+  } else {
+    summary = `New email sent to ${to} (threadId ${sendResult.threadId}).`;
+  }
+
+  return toolResult(
+    okResponse(
+      withScopedUiHints(binding, {
+        action,
+        sent: true,
+        isNewThread: !isReply && !continuesThread,
+        sentMessageId: sendResult.id,
+        threadId: sendResult.threadId,
+        deletedDraftId: sendResult.deletedDraftId,
+        deletedDraft: sendResult.deletedDraft,
+        deletedDraftError: sendResult.deletedDraftError,
+        markedReadMessageId: markResult?.messageId ?? null,
+        gmailInboxReviewLabelRemoved: reviewLabelRemoved.removed,
+        gmailInboxReviewLabelName: reviewLabelRemoved.labelName,
+        summary,
+        nextStep: isReply
+          ? "Run fetch to review the next batch, or followup_due to review due follow-ups."
+          : "Store sentMessageId and threadId for follow-up threading; use get_thread or fetch to verify delivery."
+      })
+    )
+  );
+}
+
 async function handleSendSmartReply(args, extra) {
   try {
     const input = parseSchema(sendSmartReplySchema, args);
     const scopeKey = resolveScopeKey(extra, input);
     const binding = await resolveActiveBinding(scopeKey, input.accountAlias);
     const payload = omitRoutingFields(input);
-
-    logger.info("send", {
-      messageId: payload.messageId,
-      to: payload.to,
-      subject: payload.subject
-    });
-
-    const sendResult = await sendEmail({
-      alias: binding.alias,
-      to: payload.to,
-      subject: payload.subject,
-      body: payload.body,
-      cc: payload.cc,
-      bcc: payload.bcc,
-      sourceMessageId: payload.messageId
-    });
-
-    const markResult = await markAsRead({
-      alias: binding.alias,
-      messageId: payload.messageId
-    });
-
-    const reviewLabelRemoved = await removeInboxReviewGmailLabel({
-      alias: binding.alias,
-      messageId: payload.messageId
-    });
-
-    logger.info("send complete", {
-      sentId: sendResult.id,
-      markedRead: markResult.messageId
-    });
-
-    return toolResult(
-      okResponse(
-        withScopedUiHints(binding, {
-          action: "send",
-          sent: true,
-          sentMessageId: sendResult.id,
-          threadId: sendResult.threadId,
-          deletedDraftId: sendResult.deletedDraftId,
-          deletedDraft: sendResult.deletedDraft,
-          deletedDraftError: sendResult.deletedDraftError,
-          markedReadMessageId: markResult.messageId,
-          gmailInboxReviewLabelRemoved: reviewLabelRemoved.removed,
-          gmailInboxReviewLabelName: reviewLabelRemoved.labelName,
-          summary: (() => {
-            const to = Array.isArray(payload.to) ? payload.to.join(", ") : payload.to;
-            let tail = "";
-            if (reviewLabelRemoved.removed) {
-              tail += `, inbox-review label "${reviewLabelRemoved.labelName}" removed from source`;
-            }
-            if (sendResult.deletedDraft) {
-              tail += ", and the matching Gmail draft was removed";
-            } else if (sendResult.deletedDraftError) {
-              tail += `, but draft cleanup failed: ${sendResult.deletedDraftError}`;
-            }
-            return `Email sent to ${to}, source message marked as read${tail}.`;
-          })(),
-          nextStep:
-            "Run fetch to review the next batch, or followup_due to review due follow-ups."
-        })
-      )
-    );
+    const sourceMessageId = payload.messageId?.trim() || undefined;
+    return executeApprovedSend(binding, payload, { sourceMessageId, action: "send" });
   } catch (error) {
     logger.error("send failed", { message: error.message });
     return toolResult(errorResponse(error));
   }
 }
 
-async function handleSetDraftReply(args, extra) {
+async function handleSendNewEmail(args, extra) {
   try {
-    const input = parseSchema(setDraftReplySchema, args);
+    const input = parseSchema(sendNewEmailSchema, args);
     const scopeKey = resolveScopeKey(extra, input);
     const binding = await resolveActiveBinding(scopeKey, input.accountAlias);
     const payload = omitRoutingFields(input);
+    return executeApprovedSend(
+      binding,
+      {
+        to: payload.to,
+        subject: payload.subject,
+        body: payload.body,
+        format: payload.format,
+        threadId: payload.threadId,
+        cc: payload.cc,
+        bcc: payload.bcc,
+        htmlBody: payload.htmlBody
+      },
+      { sourceMessageId: undefined, action: "send_new" }
+    );
+  } catch (error) {
+    logger.error("send_new failed", { message: error.message });
+    return toolResult(errorResponse(error));
+  }
+}
+
+async function handleSetDraftReply(args, extra) {
+  try {
+    const input = parseSchema(setDraftReplyValidatedSchema, args);
+    const scopeKey = resolveScopeKey(extra, input);
+    const binding = await resolveActiveBinding(scopeKey, input.accountAlias);
+    const payload = omitRoutingFields(input);
+    const parts = resolveOutboundEmailParts({
+      body: payload.body,
+      html: payload.html,
+      format: payload.format
+    });
 
     logger.info("set_draft", {
       messageId: payload.messageId,
       to: payload.to,
-      subject: payload.subject
+      subject: payload.subject,
+      format: parts.format
     });
 
     const result = await setReplyDraft({
@@ -656,9 +930,12 @@ async function handleSetDraftReply(args, extra) {
       sourceMessageId: payload.messageId,
       to: payload.to,
       subject: payload.subject,
-      body: payload.body,
+      body: parts.body,
+      html: parts.html,
       cc: payload.cc,
-      bcc: payload.bcc
+      bcc: payload.bcc,
+      quoteOriginal: payload.quoteOriginal,
+      appendSignature: payload.appendSignature
     });
 
     return toolResult(
@@ -713,23 +990,45 @@ async function handleTriggerFollowUp(args, extra) {
       dueWeekday: payload.dueWeekday
     };
 
+    const existingEditable = await listEditableFollowUpsForThread(
+      binding.alias,
+      generated.sourceEmail.threadId
+    );
+    const useChainedSchedule = reminderDaysList.length > 1;
+    const chainId =
+      useChainedSchedule
+        ? existingEditable.find((item) => item.followUpChainId)?.followUpChainId || randomUUID()
+        : null;
     const reminders = [];
-    for (const days of reminderDaysList) {
-      const reminder = await createFollowUpReminder({
+    const touchedReminderIds = new Set();
+    for (let sequence = 0; sequence < reminderDaysList.length; sequence++) {
+      const days = reminderDaysList[sequence];
+      const isFirstInChain = sequence === 0;
+      const scheduleRule = {
+        businessDaysOnly: schedulePolicy.businessDaysOnly,
+        dueWeekday: schedulePolicy.dueWeekday
+      };
+      const reminderPayload = {
         alias: binding.alias,
         activeEmail: binding.email,
         signerName,
         createGmailDraft: payload.createGmailDraft,
+        followUpChainId: chainId,
+        followUpSequence: useChainedSchedule ? sequence : null,
         reminderDays: days,
-        dueAt: resolveReminderDueAt(days, {
-          businessDaysOnly: schedulePolicy.businessDaysOnly,
-          dueWeekday: schedulePolicy.dueWeekday
-        }),
-        scheduleRule: {
-          businessDaysOnly: schedulePolicy.businessDaysOnly,
-          dueWeekday: schedulePolicy.dueWeekday
-        },
+        dueAt:
+          !useChainedSchedule || isFirstInChain
+            ? resolveReminderDueAt(days, scheduleRule)
+            : null,
+        status: useChainedSchedule && !isFirstInChain ? "waiting" : "pending",
+        notifiedAt: null,
+        sentAt: null,
+        resolvedAt: null,
+        resolutionReason: null,
+        lastEvaluatedAt: null,
+        scheduleRule,
         sourceMessageId: generated.sourceEmail.id,
+        sourceMessageHeaderId: generated.sourceEmail.messageHeaderId || null,
         sourceThreadId: generated.sourceEmail.threadId,
         sourceSubject: generated.sourceEmail.subject,
         sourceFrom: generated.sourceEmail.from,
@@ -742,11 +1041,27 @@ async function handleTriggerFollowUp(args, extra) {
           gmailDraftAction: generated.gmailDraft.gmailDraftAction || null,
           gmailDraftError: generated.gmailDraft.gmailDraftError || null
         }
-      });
+      };
+      const existingReminder = existingEditable[sequence];
+      const reminder = existingReminder
+        ? await updateFollowUpReminder(existingReminder.id, reminderPayload)
+        : await createFollowUpReminder(reminderPayload);
+      touchedReminderIds.add(reminder.id);
       reminders.push(reminder);
     }
 
+    const staleReminderIds = existingEditable
+      .filter((reminder) => !touchedReminderIds.has(reminder.id))
+      .map((reminder) => reminder.id);
+    if (staleReminderIds.length > 0) {
+      const staleIdSet = new Set(staleReminderIds);
+      await deleteFollowUpReminders(
+        (reminder) => reminder.alias === binding.alias && staleIdSet.has(reminder.id)
+      );
+    }
+
     logger.info("followup_trigger", {
+      action: existingEditable.length > 0 ? "update" : "create",
       reminderIds: reminders.map((r) => r.id),
       sourceMessageId: generated.sourceEmail.id,
       dueAt: reminders.map((r) => r.dueAt)
@@ -757,19 +1072,28 @@ async function handleTriggerFollowUp(args, extra) {
     return followUpResult(
       okResponse(
         withScopedUiHints(binding, {
-          action: "create",
+          action: existingEditable.length > 0 ? "update" : "create",
           createdReminderId: reminders[0]?.id || null,
           createdReminderIds: reminders.map((r) => r.id),
+          deletedReminderIds: staleReminderIds,
           reminder: reminders.length === 1 ? reminders[0] : undefined,
           items: reminders,
           message:
-            reminders.length === 1
-              ? "Follow-up reminder created."
-              : `Follow-up reminders created (${reminders.length} milestones).`,
+            existingEditable.length > 0
+              ? reminders.length === 1
+                ? "Follow-up reminder updated for this thread."
+                : `Follow-up reminders updated for this thread (${reminders.length} milestones).`
+              : reminders.length === 1
+                ? "Follow-up reminder created."
+                : `Follow-up reminders created (${reminders.length} milestones).`,
           schedule: {
             reminderDays: reminderDaysList,
+            chained: useChainedSchedule,
             businessDaysOnly: schedulePolicy.businessDaysOnly,
-            dueWeekday: schedulePolicy.dueWeekday
+            dueWeekday: schedulePolicy.dueWeekday,
+            note: useChainedSchedule
+              ? `Follow-up 1 in ${reminderDaysList[0]} day(s) from now; follow-up 2+ each wait until the previous is sent, then use that entry's day count (e.g. [1, 3] = 1 day, then 3 days after follow-up 1).`
+              : null
           },
           nextStep:
             "Run followup_due to review due reminders. Send only after explicit approval using followup_send.",
@@ -840,7 +1164,19 @@ async function handleCheckDueFollowUps(args, extra) {
       });
 
       if (updatedReminder) {
-        dueItems.push(updatedReminder);
+        dueItems.push({
+          ...updatedReminder,
+          threadContext: {
+            threadId: evaluation.sourceEmail?.threadId || updatedReminder.sourceThreadId || null,
+            messageCount: Array.isArray(evaluation.threadMessages) ? evaluation.threadMessages.length : 0,
+            firstMessage: Array.isArray(evaluation.threadMessages) && evaluation.threadMessages.length > 0 ? evaluation.threadMessages[0] : null,
+            lastMessage:
+              Array.isArray(evaluation.threadMessages) && evaluation.threadMessages.length > 0
+                ? evaluation.threadMessages[evaluation.threadMessages.length - 1]
+                : null,
+            messages: Array.isArray(evaluation.threadMessages) ? evaluation.threadMessages : []
+          }
+        });
       }
     }
 
@@ -863,6 +1199,200 @@ async function handleCheckDueFollowUps(args, extra) {
     );
   } catch (error) {
     logger.error("followup_due failed", { message: error.message });
+    return toolResult(errorResponse(error));
+  }
+}
+
+async function handleGetThread(args, extra) {
+  try {
+    const input = parseSchema(getThreadSchema, args);
+    const scopeKey = resolveScopeKey(extra, input);
+    const binding = await resolveActiveBinding(scopeKey, input.accountAlias);
+    const payload = omitRoutingFields(input);
+    const transcript = await getThread({
+      alias: binding.alias,
+      threadId: payload.threadId,
+      format: payload.format,
+      latestN: payload.latestN,
+      stripped: payload.stripped,
+      includeRaw: payload.includeRaw
+    });
+
+    const formatNote =
+      transcript.format === "metadata"
+        ? "metadata only"
+        : transcript.format === "latest"
+          ? `latest (first + ${transcript.latestN} trailing)`
+          : "full transcript";
+
+    return getThreadToolResult(
+      okResponse(
+        withScopedUiHints(binding, {
+          action: "get_thread",
+          ...transcript,
+          summary: `Loaded thread ${transcript.threadId} (${formatNote}, ${transcript.messageCount || 0} message(s)). Full message text is in the markdown below — show message.text verbatim to the user; do not summarize. Call get_thread again for the next thread.`,
+          workflowPolicy: INBOX_WORKFLOW_POLICY
+        })
+      )
+    );
+  } catch (error) {
+    logger.error("get_thread failed", { message: error.message });
+    return toolResult(errorResponse(error));
+  }
+}
+
+async function handleArchiveThread(args, extra) {
+  try {
+    const input = parseSchema(archiveThreadSchema, args);
+    const scopeKey = resolveScopeKey(extra, input);
+    const binding = await resolveActiveBinding(scopeKey, input.accountAlias);
+    const payload = omitRoutingFields(input);
+    const result = await archiveThread({ alias: binding.alias, threadId: payload.threadId });
+
+    return toolResult(
+      okResponse(
+        withScopedUiHints(binding, {
+          action: "archive",
+          threadId: result.threadId,
+          appliedLabelIds: result.appliedLabelIds,
+          summary: `Archived thread ${result.threadId} by removing the INBOX label.`
+        })
+      )
+    );
+  } catch (error) {
+    logger.error("archive failed", { message: error.message });
+    return toolResult(errorResponse(error));
+  }
+}
+
+function reminderMatchesStatus(reminder, statuses) {
+  if (!Array.isArray(statuses) || statuses.length === 0) return true;
+  return statuses.includes(reminder.status);
+}
+
+async function resolveFollowUpCleanupTargets(input, alias) {
+  const all = await listFollowUpReminders();
+  let pool = all.filter((r) => r.alias === alias && reminderMatchesStatus(r, input.statuses));
+
+  if (input.deleteAll) {
+    return pool;
+  }
+
+  const idSet = new Set();
+
+  if (input.followUpChainId) {
+    for (const r of pool) {
+      if (r.followUpChainId === input.followUpChainId) {
+        idSet.add(r.id);
+      }
+    }
+  }
+
+  if (input.messageId) {
+    for (const r of pool) {
+      if (r.sourceMessageId === input.messageId) {
+        idSet.add(r.id);
+      }
+    }
+  }
+
+  if (input.messageHeaderId) {
+    const targetHeaderId = normalizeMessageHeaderId(input.messageHeaderId);
+    for (const r of pool) {
+      if (normalizeMessageHeaderId(r.sourceMessageHeaderId) === targetHeaderId) {
+        idSet.add(r.id);
+      }
+    }
+  }
+
+  if (input.sourceThreadId) {
+    for (const r of pool) {
+      if (r.sourceThreadId === input.sourceThreadId) {
+        idSet.add(r.id);
+      }
+    }
+  }
+
+  if (Array.isArray(input.reminderIds)) {
+    for (const reminderId of input.reminderIds) {
+      const found = pool.find((r) => r.id === reminderId);
+      if (!found) continue;
+      idSet.add(found.id);
+      if (input.cancelChain && found.followUpChainId) {
+        for (const r of pool) {
+          if (r.followUpChainId === found.followUpChainId) {
+            idSet.add(r.id);
+          }
+        }
+      }
+    }
+  }
+
+  return pool.filter((r) => idSet.has(r.id));
+}
+
+async function handleFollowUpCleanup(args, extra) {
+  try {
+    const input = parseSchema(followUpCleanupSchema, args);
+    const scopeKey = resolveScopeKey(extra, input);
+    const binding = await resolveActiveBinding(scopeKey, input.accountAlias);
+    const payload = omitRoutingFields(input);
+
+    const targets = await resolveFollowUpCleanupTargets(payload, binding.alias);
+    if (targets.length === 0) {
+      throw new AppError(
+        "No follow-up reminders matched your cleanup criteria for this account.",
+        "NOT_FOUND",
+        404
+      );
+    }
+
+    const targetIds = new Set(targets.map((r) => r.id));
+    const removed = await deleteFollowUpReminders((r) => r.alias === binding.alias && targetIds.has(r.id));
+
+    const labelResults = [];
+    if (payload.removeGmailLabel !== false) {
+      const remaining = await listFollowUpReminders();
+      const bySource = new Set(
+        removed.map((r) => r.sourceMessageId).filter(Boolean)
+      );
+      for (const sourceMessageId of bySource) {
+        const stillTracked = remaining.some(
+          (r) => r.alias === binding.alias && r.sourceMessageId === sourceMessageId
+        );
+        if (!stillTracked) {
+          labelResults.push(
+            await untagSourceMessageFollowUp(binding.alias, sourceMessageId)
+          );
+        }
+      }
+    }
+
+    logger.info("followup_cleanup", {
+      alias: binding.alias,
+      removedCount: removed.length,
+      removedIds: removed.map((r) => r.id)
+    });
+
+    return followUpResult(
+      okResponse(
+        withScopedUiHints(binding, {
+          action: "cleanup",
+          deletedCount: removed.length,
+          deletedReminderIds: removed.map((r) => r.id),
+          deletedMessageHeaderIds: removed.map((r) => r.sourceMessageHeaderId).filter(Boolean),
+          items: removed,
+          gmailLabelUntagged: labelResults.filter((r) => r.ok && !r.skipped).length,
+          message:
+            removed.length === 1
+              ? "Follow-up reminder removed."
+              : `Removed ${removed.length} follow-up reminder(s).`,
+          nextStep: "Run status or followup_due to confirm nothing remains due."
+        })
+      )
+    );
+  } catch (error) {
+    logger.error("followup_cleanup failed", { message: error.message });
     return toolResult(errorResponse(error));
   }
 }
@@ -933,10 +1463,21 @@ async function handleSendFollowUp(args, extra) {
       );
     }
 
+    const parts = resolveOutboundEmailParts({
+      body: finalDraft.body,
+      html: payload.html,
+      format: payload.format
+    });
+
     const sendResult = await sendFollowUpReminder(reminder, {
-      ...finalDraft,
+      to: finalDraft.to,
+      subject: finalDraft.subject,
+      body: parts.body,
+      html: parts.html,
       cc: payload.cc,
-      bcc: payload.bcc
+      bcc: payload.bcc,
+      quoteOriginal: payload.quoteOriginal,
+      appendSignature: payload.appendSignature
     });
 
     const sentReminder = await updateFollowUpReminder(reminder.id, {
@@ -957,6 +1498,8 @@ async function handleSendFollowUp(args, extra) {
 
     await untagSourceMessageFollowUp(binding.alias, reminder.sourceMessageId);
 
+    const activatedNext = await activateNextFollowUpInChain(sentReminder);
+
     return followUpResult(
       okResponse(
         withScopedUiHints(binding, {
@@ -964,8 +1507,13 @@ async function handleSendFollowUp(args, extra) {
           sent: true,
           sentMessageId: sendResult.id,
           reminder: sentReminder,
-          message: "Follow-up email sent.",
-          nextStep: "Run followup_due to continue remaining due reminders."
+          activatedNextReminder: activatedNext,
+          message: activatedNext
+            ? `Follow-up email sent. Next follow-up scheduled for ${activatedNext.dueAt}.`
+            : "Follow-up email sent.",
+          nextStep: activatedNext
+            ? `Next follow-up (${activatedNext.id}) is due ${activatedNext.dueAt}. Run followup_due when ready.`
+            : "Run followup_due to continue remaining due reminders."
         })
       )
     );
@@ -1152,7 +1700,7 @@ async function handleWorkspaceStatus(args, extra) {
         "Run **`connect`** with a command like `Connect you@example.com personal`.",
         "Run **`connect_finish`** right after (browser login).",
         "Ask the user how replies should be signed, then **`set_signer`**.",
-        "Run **`fetch`** to load unread mail and review drafts in chat."
+        'Run **`fetch`** with `mode="list"`, then **`get_thread`** per thread you need to reply to.'
       ];
       return workspaceStatusDisplay(
         okResponse({
@@ -1179,7 +1727,9 @@ async function handleWorkspaceStatus(args, extra) {
       nextSteps.push("Ask the user what name to use on reply drafts, then run **`set_signer`**.");
     }
     if (!lastBatch) {
-      nextSteps.push("When ready, run **`fetch`** once — it builds reply drafts and review text in chat (and the review `.md` by default; set `writeMarkdownFile: false` to skip the file).");
+      nextSteps.push(
+        'When ready, run **`fetch`** with `mode="list"`, triage threads, then **`get_thread`** one at a time per thread you will reply to.'
+      );
     }
     if (dueReminders.length > 0) {
       nextSteps.push(`**${dueReminders.length} follow-up(s) due** — run \`followup_due\` to review.`);
@@ -1239,7 +1789,7 @@ export function registerTools(server) {
     {
       title: "Simple first-time setup walkthrough",
       description:
-        "Shows a step-by-step beginner flow: connect account, finish auth, set signer, review drafts, and send safely.",
+        "Shows setup and the recommended inbox workflow: fetch mode=list, triage metadata, get_thread one thread at a time, draft, send after approval.",
       inputSchema: helpOnboardingSchema
     },
     async (args) => {
@@ -1488,25 +2038,64 @@ export function registerTools(server) {
   registerToolWithPrefix(
     "fetch",
     {
-      title: "Fetch inbox emails and draft a reply for each",
+      title: "List inbox threads or batch-fetch (legacy)",
       description:
-        "Fetch inbox emails (all inbox categories) and generate a draft reply for each (default up to 10). " +
-        "Nothing is sent automatically. Review drafts first, then call `send` only after explicit approval. " +
-        "When generating drafts, avoid reusing previously addressed content from the thread history and generate a fresh, context-aware response instead.",
+        "Recommended: mode=list (default) returns lightweight metadata for triage (subject, snippet, threadId). Snippets are not full email bodies — call get_thread(threadId) for each thread the user should read or reply to, and present message.text verbatim (do not summarize). Never load multiple full threads in one context. " +
+        "queryMode=inbox (default) prepends inbox review filters (in:inbox, exclude follow-up label). queryMode=raw passes query to Gmail unchanged — use for sent mail, archives, all-mail, and date-filtered analysis (e.g. in:sent after:2026/01/01). " +
+        "Legacy mode=full batch-loads bodies and auto-drafts every thread (token-heavy; avoid for normal inbox review). Nothing is sent automatically.",
       inputSchema: fetchUnreadSmartDraftsSchema
     },
     handleFetchUnreadSmartDrafts
   );
 
   registerToolWithPrefix(
+    "get_thread",
+    {
+      title: "Get one Gmail thread as a clean transcript",
+      description:
+        "Load one Gmail thread at a time (use after fetch mode=list). format=full (default) returns plain-text message bodies. Use stripped=false to read the full email; stripped=true removes quoted reply history when drafting in multi-message threads. format=latest trims to first + latestN messages. Present message.text verbatim to the user — do not summarize. Call separately per thread.",
+      inputSchema: getThreadSchema
+    },
+    handleGetThread
+  );
+
+  registerToolWithPrefix(
+    "archive",
+    {
+      title: "Archive one Gmail thread",
+      description:
+        "Archive a Gmail thread for the active account by removing the INBOX label. Use threadId from fetch, followup_due, or get_thread.",
+      inputSchema: archiveThreadSchema
+    },
+    handleArchiveThread
+  );
+
+  registerToolWithPrefix(
     "send",
     {
-      title: "Send one reply the user approved (real email)",
+      title: "Send one approved reply",
       description:
-        "Send one approved reply and mark the source message as read. Requires `messageId`, `to`, `subject`, and `body` from a reviewed draft. Never run without explicit approval.",
-      inputSchema: sendSmartReplySchema
+        "Send one approved **reply**. Requires `messageId` (marks source read, threads send). Provide `body`; set `format` to `text/html` for HTML (default `text/plain`). Legacy `html` still supported. " +
+        "`quoteOriginal` (default true) appends Gmail-style quoted parent history below the new body. " +
+        "`appendSignature` (default true) appends the account Gmail signature from Settings above the quote block. " +
+        "For new outbound / campaigns use `send_new` instead. Never run without explicit approval.",
+      inputSchema: sendSmartReplyBaseSchema
     },
     handleSendSmartReply
+  );
+
+  registerToolWithPrefix(
+    "send_new",
+    {
+      title: "Send one approved new outbound email",
+      description:
+        "Send one approved **new** email. Use for campaigns and cold outreach — no `messageId`. " +
+        "Optional `threadId` from a prior send to add the next message in the same Gmail thread (campaign email 2+). " +
+        "Requires `to` and `subject`; German/Unicode subjects are RFC 2047–encoded automatically. " +
+        "Provide `body` with `format` `text/html` for HTML campaigns (default `text/plain`). Legacy `htmlBody` still supported. Never run without explicit approval.",
+      inputSchema: sendNewEmailBaseSchema
+    },
+    handleSendNewEmail
   );
 
   // ─── Follow-up reminders ───────────────────────────────────────────────────
@@ -1516,7 +2105,9 @@ export function registerTools(server) {
     {
       title: "Save or update a Gmail draft reply",
       description:
-        "Save/update a Gmail draft reply for a thread without sending. Requires `messageId`, `to`, `subject`, and `body` from a reviewed draft.",
+        "Save/update a Gmail draft reply for a thread without sending. Requires `messageId`, `to`, `subject`, and `body`; use `format` `text/html` for HTML drafts (default `text/plain`). " +
+        "`quoteOriginal` (default true) appends Gmail-style quoted parent history so drafts show the collapsible history expander in Gmail. " +
+        "`appendSignature` (default true) appends the account Gmail signature from Settings above the quote block.",
       inputSchema: setDraftReplySchema
     },
     handleSetDraftReply
@@ -1525,9 +2116,11 @@ export function registerTools(server) {
   registerToolWithPrefix(
     "followup_trigger",
     {
-      title: "Create follow-up reminders using pattern or days list",
+      title: "Create or update follow-up reminders for a thread",
       description:
-        "Create follow-up reminders for a thread using either `pattern` (e.g. '1st follow after 10 days, 2nd follow after 15 days') or explicit `daysList`.",
+        "Create follow-up reminders using `daysList` or `pattern`, or update the existing open follow-up plan for the same thread. " +
+        "For `daysList: [1, 3]`: follow-up 1 is due in 1 day from now; follow-up 2 is due 3 days after follow-up 1 is sent (not 3 days from today). " +
+        "Each value after the first is always an interval after the previous follow-up send. Example: 1 day, then 3 days after the first — use `[1, 3]`, not `[1, 2]`.",
       // Use base schema (plain z.object) for MCP registration — the SDK's JSON Schema
       // normaliser cannot serialise ZodEffects (from superRefine) and would produce an
       // empty properties block, stripping all arguments before the handler runs (BUG-1).
@@ -1543,7 +2136,8 @@ export function registerTools(server) {
     {
       title: "List follow-up reminders that are due now",
       description:
-        "List reminders due now for the active account and refresh thread state before review.",
+        "List reminders due now for the active account and refresh thread state before review. " +
+        "Returns the refreshed full thread context for each due reminder. Always present the full draft to the user for proof-reading before any send action. Never call followup_send without explicit user approval.",
       inputSchema: followUpCheckDueSchema
     },
     handleCheckDueFollowUps
@@ -1554,10 +2148,25 @@ export function registerTools(server) {
     {
       title: "Send one follow-up the user approved",
       description:
-        "Send one approved follow-up reminder. Re-checks the thread first and blocks send if customer already replied.",
+        "Send one approved follow-up reminder. Re-checks the thread first and blocks send if customer already replied. " +
+        "Optional overrides: `body`, `format` (`text/plain` default, `text/html` for HTML), `quoteOriginal` (default true), `appendSignature` (default true). IMPORTANT: NEVER call without explicit user approval after showing the draft.",
       inputSchema: followUpSendSchema
     },
     handleSendFollowUp
+  );
+
+  registerToolWithPrefix(
+    "followup_cleanup",
+    {
+      title: "Delete stored follow-up reminders",
+      description:
+        "Remove follow-up reminder(s) from the local store. Pass reminderIds, messageId, messageHeaderId, sourceThreadId, or followUpChainId. " +
+        "Use cancelChain: true with reminderIds to drop an entire chained sequence. " +
+        "Use deleteAll: true with confirm: true to clear all reminders for the account. " +
+        "Optionally removes the Gmail follow-up label when no reminders remain for a thread.",
+      inputSchema: followUpCleanupBaseSchema
+    },
+    handleFollowUpCleanup
   );
 
   registerToolWithPrefix(
@@ -1584,8 +2193,10 @@ export function registerTools(server) {
   registerToolWithPrefix(
     "fetch_sent",
     {
-      title: "List Gmail Sent folder",
-      description: "List messages in Gmail Sent folder. Separate from inbox. Use to review previously sent emails.",
+      title: "List Gmail Sent folder (deprecated)",
+      description:
+        "Deprecated — prefer multi_gmail_fetch with queryMode=raw and a Gmail query such as in:sent after:2026/01/01 before:2026/04/01 for filtered sent-mail analysis. " +
+        "This tool still lists the latest messages in Gmail Sent without date/query filters.",
       inputSchema: fetchSentSchema
     },
     async (args, extra) => {
@@ -1594,7 +2205,16 @@ export function registerTools(server) {
         const scopeKey = resolveScopeKey(extra, input);
         const binding = await resolveActiveBinding(scopeKey, input.accountAlias);
         const data = await fetchGmailSent({ alias: binding.alias, maxResults: input.maxResults });
-        return toolResult(okResponse(withScopedUiHints(binding, data)));
+        return toolResult(
+          okResponse(
+            withScopedUiHints(binding, {
+              ...data,
+              deprecated: true,
+              deprecationNotice:
+                "Use multi_gmail_fetch with queryMode=raw and query like in:sent after:2026/01/01 before:2026/04/01 instead."
+            })
+          )
+        );
       } catch (error) {
         logger.error("fetch_sent failed", { message: error.message });
         return toolResult(errorResponse(error));

@@ -6,7 +6,8 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "auth": "node src/auth/authorize-account.js"
+    "auth": "node src/auth/authorize-account.js",
+    "test": "node --test test-gmail-signature.mjs test-mime-headers.mjs test-email-body-stripper.mjs test-recipients.mjs test-quote-reply.mjs test-fetch-query.mjs"
   },
   "keywords": [
     "gmail",
@@ -36,7 +37,10 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.13.2",
+    "email-reply-parser": "^2.3.5",
     "googleapis": "^171.4.0",
+    "jsdom": "^29.1.1",
+    "planer": "^1.2.0",
     "zod": "^3.23.8"
   }
 }

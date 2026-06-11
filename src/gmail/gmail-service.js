@@ -1,30 +1,139 @@
 import { randomBytes } from "crypto";
 import { env } from "../config/env.js";
-import { DEFAULT_MAX_RESULTS, MAX_RESULTS_LIMIT } from "../config/constants.js";
-import { formatFullMessage, formatMessageSummary, encodeEmail } from "../utils/gmail-formatters.js";
+import { inboxWorkflowPayload, INBOX_WORKFLOW_AVOID } from "../config/inbox-workflow.js";
+import {
+  DEFAULT_MAX_RESULTS,
+  DEFAULT_THREAD_LATEST_N,
+  MAX_RESULTS_LIMIT
+} from "../config/constants.js";
+import {
+  formatFullMessage,
+  formatMessageSummary,
+  encodeEmail,
+  normalizeEmailAddress,
+  stripHtmlToText
+} from "../utils/gmail-formatters.js";
+import { extractNewReplyContent } from "../utils/email-body-stripper.js";
+import { encodeMimeHeaderValue, sanitizeMimeHeaderValue } from "../utils/mime-headers.js";
+import { appendQuotedReply } from "../utils/quote-reply.js";
 import { safeNumber } from "../utils/validators.js";
 import { createGmailClient } from "./gmail-client.js";
+import { applyAccountSignature } from "./gmail-signature.js";
+import { buildFetchGmailListQuery, fetchListLabelIds } from "./build-fetch-query.js";
+import {
+  buildThreadMetadataTranscript,
+  buildThreadTranscript,
+  sortMessagesAscByInternalDate,
+  threadMetadataToListItem
+} from "./thread-transcript.js";
 import { getOrCreateUserLabelId, addLabelToMessage, removeLabelFromMessage, ensureMcpSidebarLabels } from "./gmail-labels.js";
 import { AppError } from "../utils/errors.js";
 import { promises as fs } from "fs";
 import path from "path";
 
-/** All messages in Inbox across all categories (Primary/Promotions/Social/Updates/Forums). */
-const INBOX_QUERY = "in:inbox";
+function buildFetchListQuery(query, queryMode) {
+  return buildFetchGmailListQuery({
+    query,
+    queryMode,
+    followUpLabelName: env.FOLLOW_UP_GMAIL_LABEL_NAME,
+    followUpLabelEnabled: env.FOLLOW_UP_GMAIL_LABEL_ENABLED
+  });
+}
 
-/** Keep listing scoped to Inbox only. */
-const INBOX_LABEL_IDS = ["INBOX"];
-
-function inboxListRequest(boundedMaxResults, query, pageToken) {
-  const trimmed = query?.trim() ? query.trim() : "";
-  const q = trimmed ? `${INBOX_QUERY} ${trimmed}` : INBOX_QUERY;
-  return {
+function inboxListRequest(boundedMaxResults, query, pageToken, queryMode = "inbox") {
+  const labelIds = fetchListLabelIds(queryMode);
+  const params = {
     userId: env.DEFAULT_GMAIL_USER_ID,
-    q,
-    labelIds: INBOX_LABEL_IDS,
+    q: buildFetchListQuery(query, queryMode),
     includeSpamTrash: false,
     maxResults: boundedMaxResults,
     pageToken
+  };
+  if (labelIds) {
+    params.labelIds = labelIds;
+  }
+  return params;
+}
+
+const THREAD_METADATA_HEADERS = ["From", "To", "Cc", "Subject", "Date"];
+
+async function fetchAccountEmail(gmail) {
+  const profile = await gmail.users.getProfile({ userId: env.DEFAULT_GMAIL_USER_ID });
+  return String(profile?.data?.emailAddress || "").toLowerCase();
+}
+
+/** Lightweight thread list (metadata only, no bodies or drafts). */
+async function fetchInboxThreadListMetadata({ alias, maxResults, query, queryMode = "inbox" }) {
+  const { gmail } = await createGmailClient(alias);
+  const accountEmail = await fetchAccountEmail(gmail);
+  const boundedMaxResults = safeNumber(maxResults, DEFAULT_MAX_RESULTS, 1, MAX_RESULTS_LIMIT);
+
+  const listQuery = buildFetchListQuery(query, queryMode);
+  const labelIds = fetchListLabelIds(queryMode);
+
+  let pageToken = undefined;
+  const threadIds = [];
+  let lastListResponse = null;
+
+  do {
+    const pageSize = Math.min(100, boundedMaxResults - threadIds.length);
+    if (pageSize <= 0) break;
+
+    const response = await gmail.users.threads.list({
+      userId: env.DEFAULT_GMAIL_USER_ID,
+      q: listQuery,
+      ...(labelIds ? { labelIds } : {}),
+      includeSpamTrash: false,
+      maxResults: pageSize,
+      pageToken
+    });
+    lastListResponse = response;
+
+    for (const thread of response.data.threads || []) {
+      if (threadIds.length >= boundedMaxResults) break;
+      if (thread?.id) threadIds.push(thread.id);
+    }
+
+    pageToken = response.data.nextPageToken || undefined;
+  } while (pageToken && threadIds.length < boundedMaxResults);
+
+  const threadResponses = await Promise.all(
+    threadIds.map((threadId) =>
+      gmail.users.threads.get({
+        userId: env.DEFAULT_GMAIL_USER_ID,
+        id: threadId,
+        format: "metadata",
+        metadataHeaders: THREAD_METADATA_HEADERS
+      })
+    )
+  );
+  const items = [];
+  for (const threadRes of threadResponses) {
+    const item = threadMetadataToListItem(threadRes.data, accountEmail);
+    if (item) items.push(item);
+  }
+
+  const threadCount = items.length;
+
+  return {
+    mode: "list",
+    queryMode,
+    nextPageToken: lastListResponse?.data?.nextPageToken || null,
+    gmailListQuery: listQuery,
+    inboxThreadCount: threadCount,
+    threadCount,
+    uniqueThreadCount: threadCount,
+    inboxCount: threadCount,
+    items,
+    noUnreadHint:
+      threadCount === 0
+        ? "No inbox threads matched this query. Your mail may be archived, in Spam/Trash, or filtered by query."
+        : null,
+    chatOutputNote:
+      threadCount === 0
+        ? "No inbox threads matched. Adjust query or check labels/filters."
+        : `Listed ${threadCount} inbox thread(s) (metadata only). Triage from this list, then call get_thread once per selected thread — never batch full threads.`,
+    workflow: inboxWorkflowPayload()
   };
 }
 
@@ -128,8 +237,76 @@ export async function listThreads({ alias, query, maxResults, pageToken }) {
   };
 }
 
+async function getThreadFull(gmail, threadId) {
+  const threadRes = await gmail.users.threads.get({
+    userId: env.DEFAULT_GMAIL_USER_ID,
+    id: threadId,
+    format: "full"
+  });
+  const messages = sortMessagesAscByInternalDate(
+    (threadRes.data.messages || []).map((message) => formatFullMessage(message))
+  );
+  const firstMessage = messages[0] || null;
+  const lastMessage = messages[messages.length - 1] || null;
+  return {
+    id: threadRes.data.id,
+    historyId: threadRes.data.historyId,
+    snippet: threadRes.data.snippet || "",
+    messageCount: messages.length,
+    firstMessage,
+    lastMessage,
+    messages
+  };
+}
+
+async function getThreadMetadataTranscript(gmail, threadId, accountEmail) {
+  const threadRes = await gmail.users.threads.get({
+    userId: env.DEFAULT_GMAIL_USER_ID,
+    id: threadId,
+    format: "metadata",
+    metadataHeaders: THREAD_METADATA_HEADERS
+  });
+  const messages = sortMessagesAscByInternalDate(
+    (threadRes.data.messages || []).map((message) => formatMessageSummary(message))
+  );
+
+  return buildThreadMetadataTranscript({ id: threadRes.data.id, messages }, accountEmail);
+}
+
+export async function getThread({
+  alias,
+  threadId,
+  format = "full",
+  latestN = DEFAULT_THREAD_LATEST_N,
+  stripped = false,
+  includeRaw = false
+}) {
+  const { gmail } = await createGmailClient(alias);
+  const accountEmail = await fetchAccountEmail(gmail);
+
+  if (format === "metadata") {
+    return getThreadMetadataTranscript(gmail, threadId, accountEmail);
+  }
+
+  const raw = await getThreadFull(gmail, threadId);
+  return buildThreadTranscript(raw, accountEmail, { format, latestN, stripped, includeRaw });
+}
+
+export async function archiveThread({ alias, threadId }) {
+  const { gmail } = await createGmailClient(alias);
+  const response = await gmail.users.threads.modify({
+    userId: env.DEFAULT_GMAIL_USER_ID,
+    id: threadId,
+    requestBody: { removeLabelIds: ["INBOX"] }
+  });
+  return {
+    threadId: response.data.id || threadId,
+    appliedLabelIds: response.data.labelIds || []
+  };
+}
+
 function sanitizeHeaderValue(value) {
-  return String(value || "").replace(/[\r\n]+/g, " ").trim();
+  return sanitizeMimeHeaderValue(value);
 }
 
 function buildReplyHeaders(sourceEmail) {
@@ -149,12 +326,12 @@ function buildReplyHeaders(sourceEmail) {
   return headers;
 }
 
-function buildRawEmail({ to, subject, body, cc, bcc, html, extraHeaders = [] }) {
+export function buildRawEmail({ to, subject, body, cc, bcc, html, extraHeaders = [] }) {
   const formatAddress = (addr) => (Array.isArray(addr) ? addr.join(", ") : addr);
 
   const boundary = randomBytes(16).toString("hex");
   let headers = `To: ${formatAddress(to)}\r\n`;
-  headers += `Subject: ${subject}\r\n`;
+  headers += `Subject: ${encodeMimeHeaderValue(subject)}\r\n`;
   if (cc) headers += `Cc: ${formatAddress(cc)}\r\n`;
   if (bcc) headers += `Bcc: ${formatAddress(bcc)}\r\n`;
   for (const headerLine of extraHeaders) {
@@ -212,11 +389,11 @@ async function findExistingGmailDraftId(gmail, sourceMessageId) {
   return null;
 }
 
-async function saveGmailDraft(gmail, { to, subject, body, cc, bcc, sourceEmail }) {
+async function saveGmailDraft(gmail, { to, subject, body, cc, bcc, html, sourceEmail }) {
   if (!to) return { gmailDraftId: null, gmailDraftError: "No reply-to address — draft not saved to Gmail." };
   try {
     const extraHeaders = buildReplyHeaders(sourceEmail);
-    const raw = buildRawEmail({ to, subject, body, cc, bcc, extraHeaders });
+    const raw = buildRawEmail({ to, subject, body, cc, bcc, html, extraHeaders });
     const existingDraftId = await findExistingGmailDraftId(gmail, sourceEmail?.id);
     const requestBody = {
       message: {
@@ -280,8 +457,51 @@ async function deleteGmailDraftById(gmail, draftId) {
   }
 }
 
-export async function sendEmail({ alias, to, subject, body, cc, bcc, html, sourceMessageId }) {
+function resolveSendPlainBody(body, html) {
+  const plain = typeof body === "string" ? body.trim() : "";
+  if (plain) return plain;
+  if (html) return stripHtmlToText(html).trim() || "(no plain-text version)";
+  throw new AppError("body or html is required to send", "VALIDATION_ERROR", 400);
+}
+
+function applyReplyQuote({ body, html, sourceEmail, quoteOriginal = true }) {
+  if (!sourceEmail) {
+    return {
+      body: resolveSendPlainBody(body, html),
+      html: typeof html === "string" && html.trim() ? html.trim() : undefined
+    };
+  }
+
+  const plainSeed = resolveSendPlainBody(body, html);
+  const htmlSeed = typeof html === "string" && html.trim() ? html.trim() : undefined;
+  const quoted = appendQuotedReply({
+    body: plainSeed,
+    html: htmlSeed,
+    sourceEmail,
+    quoteOriginal: quoteOriginal !== false
+  });
+
+  return {
+    body: quoted.body,
+    html: quoted.html
+  };
+}
+
+export async function sendEmail({
+  alias,
+  to,
+  subject,
+  body,
+  cc,
+  bcc,
+  html,
+  sourceMessageId,
+  threadId: explicitThreadId,
+  quoteOriginal = true,
+  appendSignature = true
+}) {
   const { gmail } = await createGmailClient(alias);
+  const fromAddress = await fetchAccountEmail(gmail);
   let sourceEmail = null;
   if (sourceMessageId) {
     let sourceRes;
@@ -309,21 +529,38 @@ export async function sendEmail({ alias, to, subject, body, cc, bcc, html, sourc
     sourceEmail = formatFullMessage(sourceRes.data);
   }
 
+  const plainSeed = resolveSendPlainBody(body, html);
+  const htmlSeed = typeof html === "string" && html.trim() ? html.trim() : undefined;
+  const signed = await applyAccountSignature({
+    gmail,
+    fromAddress,
+    body: plainSeed,
+    html: htmlSeed,
+    appendSignature
+  });
+  const merged = applyReplyQuote({
+    body: signed.body,
+    html: signed.html,
+    sourceEmail,
+    quoteOriginal
+  });
+
   const raw = buildRawEmail({
     to,
     subject,
-    body,
+    body: merged.body,
     cc,
     bcc,
-    html,
+    html: merged.html,
     extraHeaders: buildReplyHeaders(sourceEmail)
   });
 
+  const threadId = explicitThreadId?.trim() || sourceEmail?.threadId || undefined;
   const response = await gmail.users.messages.send({
     userId: env.DEFAULT_GMAIL_USER_ID,
     requestBody: {
       raw,
-      ...(sourceEmail?.threadId ? { threadId: sourceEmail.threadId } : {})
+      ...(threadId ? { threadId } : {})
     }
   });
 
@@ -341,7 +578,18 @@ export async function sendEmail({ alias, to, subject, body, cc, bcc, html, sourc
   };
 }
 
-export async function setReplyDraft({ alias, sourceMessageId, to, subject, body, cc, bcc }) {
+export async function setReplyDraft({
+  alias,
+  sourceMessageId,
+  to,
+  subject,
+  body,
+  cc,
+  bcc,
+  html,
+  quoteOriginal = true,
+  appendSignature = true
+}) {
   if (!sourceMessageId) {
     throw new AppError("sourceMessageId is required to save a reply draft", "VALIDATION_ERROR", 400);
   }
@@ -353,11 +601,29 @@ export async function setReplyDraft({ alias, sourceMessageId, to, subject, body,
     format: "full"
   });
   const sourceEmail = formatFullMessage(sourceRes.data);
-  const finalTo = Array.isArray(to) ? to.join(", ") : to;
+  const fromAddress = await fetchAccountEmail(gmail);
+  const plainSeed = resolveSendPlainBody(body, html);
+  const htmlSeed = typeof html === "string" && html.trim() ? html.trim() : undefined;
+  const signed = await applyAccountSignature({
+    gmail,
+    fromAddress,
+    body: plainSeed,
+    html: htmlSeed,
+    appendSignature
+  });
+  const merged = applyReplyQuote({
+    body: signed.body,
+    html: signed.html,
+    sourceEmail,
+    quoteOriginal
+  });
   const draftResult = await saveGmailDraft(gmail, {
-    to: finalTo,
+    to,
     subject,
-    body,
+    body: merged.body,
+    cc,
+    bcc,
+    html: merged.html,
     sourceEmail
   });
 
@@ -480,27 +746,6 @@ function firstSentencePreview(text) {
   return clip;
 }
 
-function cleanEmailBodyForAnalysis(bodyText) {
-  const text = String(bodyText || "").replace(/\r/g, "");
-  const lines = text.split("\n");
-  const kept = [];
-
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) {
-      if (kept.length > 0 && kept[kept.length - 1] !== "") kept.push("");
-      continue;
-    }
-    if (/^>/.test(line)) continue;
-    if (/^[-_]{2,}\s*original message\s*[-_]{2,}$/i.test(line)) break;
-    if (/^on .+wrote:$/i.test(line)) break;
-    if (/^(from|sent|subject|to|cc):\s+/i.test(line)) continue;
-    kept.push(line);
-  }
-
-  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-
 function splitMeaningfulSentences(text) {
   const normalized = String(text || "").replace(/\r/g, " ").replace(/\n+/g, " ").replace(/\s+/g, " ").trim();
   if (!normalized) return [];
@@ -530,7 +775,7 @@ function buildReviewSummary(sentences, request, subject, preview) {
 }
 
 function analyzeEmail(email, threadMessageCount) {
-  const cleanBody = cleanEmailBodyForAnalysis(email.bodyText || email.snippet || "");
+  const cleanBody = extractNewReplyContent(email.bodyText || email.snippet || "");
   const sentences = splitMeaningfulSentences(cleanBody);
   const preview = firstSentencePreview(cleanBody || email.snippet || "");
   // Pass the full email object so extractIntent can inspect labelIds and
@@ -653,7 +898,7 @@ async function saveUnreadDraftsMarkdownFile({ alias, listQuery, draftsMarkdown, 
     `- **Account alias:** ${alias}`,
     `- **File:** \`${path.join(reviewDirRel, filename).replace(/\\/g, "/")}\``,
     `- **Gmail list query:** \`${listQuery}\``,
-    `- **Messages in this file:** ${itemCount}`,
+    `- **Threads in this file:** ${itemCount}`,
     `- **Generated (UTC):** ${new Date().toISOString()}`,
     "",
     "---",
@@ -667,6 +912,8 @@ async function saveUnreadDraftsMarkdownFile({ alias, listQuery, draftsMarkdown, 
 function formatDraftReplyMarkdown(
   draftReply,
   messageId,
+  threadId,
+  threadMessageCount,
   gmailDraftId,
   gmailDraftAction,
   { reviewOnlyNoGmailDraft = false } = {}
@@ -687,6 +934,8 @@ function formatDraftReplyMarkdown(
     "### Reply draft",
     "",
     `- **messageId:** \`${messageId}\``,
+    threadId ? `- **threadId:** \`${threadId}\`` : null,
+    Number.isFinite(threadMessageCount) ? `- **Thread messages:** ${threadMessageCount}` : null,
     statusLine,
     `- **To:** ${to}`,
     `- **Subject:** ${subject}`,
@@ -695,7 +944,7 @@ function formatDraftReplyMarkdown(
     "",
     fencedMarkdownBlock(body, "text")
   ];
-  return lines.join("\n");
+  return lines.filter(Boolean).join("\n");
 }
 
 /**
@@ -746,36 +995,57 @@ export async function fetchUnreadSummariesAndReplyDrafts({
   alias,
   maxResults,
   query,
+  queryMode = "inbox",
+  mode = "list",
   writeMarkdownFile = true,
   signerName = null,
   saveGmailDrafts = false
 }) {
+  if (mode === "list") {
+    return fetchInboxThreadListMetadata({ alias, maxResults, query, queryMode });
+  }
+
   const { gmail } = await createGmailClient(alias);
   const boundedMaxResults = safeNumber(maxResults, DEFAULT_MAX_RESULTS, 1, MAX_RESULTS_LIMIT);
-  const listParams = inboxListRequest(boundedMaxResults, query, undefined);
+
+  const listParams = inboxListRequest(boundedMaxResults, query, undefined, queryMode);
 
   /** Eagerly create user labels so they appear under Gmail’s Labels list before any message is tagged. */
   const { inboxReviewLabelId } = await ensureMcpSidebarLabels(gmail);
 
-  const response = await gmail.users.messages.list(listParams);
+  let pageToken = undefined;
+  const threadIds = [];
+  const seenThreadIds = new Set();
+  let lastListResponse = null;
+  do {
+    const response = await gmail.users.messages.list({
+      ...listParams,
+      pageToken
+    });
+    lastListResponse = response;
+    const pageMessages = response.data.messages || [];
+    for (const item of pageMessages) {
+      if (threadIds.length >= boundedMaxResults) break;
+      const messageMeta = await gmail.users.messages.get({
+        userId: env.DEFAULT_GMAIL_USER_ID,
+        id: item.id,
+        format: "metadata",
+        metadataHeaders: ["Subject"]
+      });
+      const threadId = messageMeta.data.threadId;
+      if (!threadId || seenThreadIds.has(threadId)) continue;
+      seenThreadIds.add(threadId);
+      threadIds.push(threadId);
+    }
+    pageToken = response.data.nextPageToken || undefined;
+  } while (pageToken && threadIds.length < boundedMaxResults);
 
-  const inboxMessages = response.data.messages || [];
   const items = [];
-
-  for (const item of inboxMessages) {
-    const fullRes = await gmail.users.messages.get({
-      userId: env.DEFAULT_GMAIL_USER_ID,
-      id: item.id,
-      format: "full"
-    });
-    const fullEmail = formatFullMessage(fullRes.data);
-    const threadRes = await gmail.users.threads.get({
-      userId: env.DEFAULT_GMAIL_USER_ID,
-      id: fullEmail.threadId,
-      format: "metadata",
-      metadataHeaders: ["From", "To", "Subject", "Date"]
-    });
-    const threadMessageCount = threadRes.data.messages?.length || 1;
+  for (const threadId of threadIds) {
+    const thread = await getThreadFull(gmail, threadId);
+    const fullEmail = thread.lastMessage || thread.firstMessage;
+    if (!fullEmail) continue;
+    const threadMessageCount = thread.messageCount;
 
     const analysis = analyzeEmail(fullEmail, threadMessageCount);
     const replyTo = extractReplyToAddress(fullEmail.replyToHeader || fullEmail.from);
@@ -814,7 +1084,7 @@ export async function fetchUnreadSummariesAndReplyDrafts({
     }
 
     let gmailInboxReviewLabelError = null;
-    if (inboxReviewLabelId) {
+    if (inboxReviewLabelId && queryMode !== "raw") {
       try {
         await addLabelToMessage(gmail, fullEmail.id, inboxReviewLabelId);
       } catch (err) {
@@ -822,18 +1092,31 @@ export async function fetchUnreadSummariesAndReplyDrafts({
       }
     }
 
-    const draftReplyMarkdown = formatDraftReplyMarkdown(draftReply, fullEmail.id, gmailDraftId, gmailDraftAction, {
-      reviewOnlyNoGmailDraft: !saveGmailDrafts
-    });
+    const draftReplyMarkdown = formatDraftReplyMarkdown(
+      draftReply,
+      fullEmail.id,
+      thread.id,
+      thread.messageCount,
+      gmailDraftId,
+      gmailDraftAction,
+      {
+        reviewOnlyNoGmailDraft: !saveGmailDrafts
+      }
+    );
 
     items.push({
       messageId: fullEmail.id,
-      threadId: fullEmail.threadId,
+      threadId: thread.id,
       from: fullEmail.from,
       to: fullEmail.to,
       subject: fullEmail.subject,
       date: fullEmail.date || fullEmail.internalDate,
       threadMessageCount,
+      threadContext: {
+        threadId: thread.id,
+        messageCount: thread.messageCount,
+        messages: thread.messages
+      },
       intentType: analysis.intent.type,
       intentDetail: analysis.intent.summary,
       mailSummary,
@@ -858,7 +1141,7 @@ export async function fetchUnreadSummariesAndReplyDrafts({
 
   const draftsMarkdown =
     items.length === 0
-      ? "*No inbox messages matched this run — no reply drafts.*"
+      ? "*No inbox threads matched this run — no reply drafts.*"
       : items.map((row) => row.draftReplyMarkdown).join("\n\n---\n\n");
 
   let markdownFile = null;
@@ -882,22 +1165,30 @@ export async function fetchUnreadSummariesAndReplyDrafts({
       : 0;
 
   return {
-    /** Helps MCP clients: one run = drafts for every inbox message listed (up to maxResults). */
-    batchDraftPolicy: "all_fetched_inbox",
+    mode: "full",
+    queryMode,
+    /** Helps MCP clients: one run = drafts for every inbox thread listed (up to maxResults unique threads). */
+    batchDraftPolicy: "all_fetched_inbox_threads",
+    workflowWarning: INBOX_WORKFLOW_AVOID,
+    workflow: inboxWorkflowPayload(),
     saveGmailDrafts,
-    nextPageToken: response.data.nextPageToken || null,
+    nextPageToken: lastListResponse?.data?.nextPageToken || null,
     gmailListQuery: listParams.q,
-    gmailListLabelIds: INBOX_LABEL_IDS,
+    gmailListLabelIds: listParams.labelIds ?? null,
+    inboxThreadCount: items.length,
+    unreadThreadCount: items.length,
+    threadCount: items.length,
+    uniqueThreadCount: items.length,
     inboxCount: items.length,
     unreadCount: items.length,
     awaitingUserFeedback: items.length > 0,
     chatOutputNote: (() => {
       const fileNote = markdownFile
-        ? `Saved reply drafts to **${markdownFile}** (single Markdown file, overwritten each fetch). Use send after user approval.`
+        ? `Saved reply drafts for **${items.length} inbox thread(s)** to **${markdownFile}** (single Markdown file, overwritten each fetch). Use send after user approval.`
         : writeMarkdownFile && items.length > 0 && markdownSaveError
           ? `Could not write .md file: ${markdownSaveError}. Use draftsMarkdown from JSON.`
           : items.length === 0
-            ? "No inbox messages matched — no .md file written. draftsMarkdown explains why."
+            ? "No inbox threads matched — no .md file written. draftsMarkdown explains why."
             : !writeMarkdownFile
               ? "writeMarkdownFile was false — no .md on disk; use draftsMarkdown in JSON."
               : "Use draftsMarkdown from JSON.";
@@ -915,7 +1206,7 @@ export async function fetchUnreadSummariesAndReplyDrafts({
 
     noUnreadHint:
       items.length === 0
-        ? "No inbox messages matched this query. Your mail may be archived, in Spam/Trash, or filtered by query."
+        ? "No inbox threads matched this query. Your mail may be archived, in Spam/Trash, or filtered by query."
         : null,
     items
   };

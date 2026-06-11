@@ -3,6 +3,7 @@ import { createGmailClient } from "../gmail/gmail-client.js";
 import { sendEmail } from "../gmail/gmail-service.js";
 import { env } from "../config/env.js";
 import { formatFullMessage, encodeEmail } from "../utils/gmail-formatters.js";
+import { encodeMimeHeaderValue } from "../utils/mime-headers.js";
 
 function sanitizeHeaderValue(value) {
   return String(value || "").replace(/[\r\n]+/g, " ").trim();
@@ -50,7 +51,7 @@ function buildRawEmail({ to, subject, body, cc, bcc, extraHeaders = [] }) {
   const formatAddress = (addr) => (Array.isArray(addr) ? addr.join(", ") : addr);
 
   let headers = `To: ${formatAddress(to)}\r\n`;
-  headers += `Subject: ${subject}\r\n`;
+  headers += `Subject: ${encodeMimeHeaderValue(subject)}\r\n`;
   if (cc) headers += `Cc: ${formatAddress(cc)}\r\n`;
   if (bcc) headers += `Bcc: ${formatAddress(bcc)}\r\n`;
   for (const headerLine of extraHeaders) {
@@ -377,9 +378,12 @@ export async function sendFollowUpReminder(reminder, overrides = {}) {
     to,
     subject,
     body,
+    html: overrides.html,
     cc: overrides.cc,
     bcc: overrides.bcc,
-    sourceMessageId: reminder.sourceMessageId
+    sourceMessageId: reminder.sourceMessageId,
+    quoteOriginal: overrides.quoteOriginal,
+    appendSignature: overrides.appendSignature
   });
 }
 
