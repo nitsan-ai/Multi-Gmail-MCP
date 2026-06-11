@@ -7,7 +7,7 @@ It lets your assistant:
 - scan the inbox with lightweight **list** mode (metadata only)
 - load **one full thread at a time** with `get_thread` (plain or quote-stripped bodies)
 - draft replies from real message text (not Gmail snippets)
-- send **replies** (`send`) or **new outbound** mail (`send_new`), including HTML campaigns
+- send **replies** (`send`) or **new outbound** mail (`send_new`), including HTML bodies
 - save drafts to Gmail
 - send only after explicit approval
 - manage follow-up reminders for email threads
@@ -23,7 +23,7 @@ This server is **thread-first**, not message-first, and **metadata-first** for i
 - `multi_gmail_fetch` with **`mode=list`** (default) returns small per-thread metadata — snippets are **not** full emails
 - for each thread you care about, call **`multi_gmail_get_thread` once** — never load many full threads in one LLM context
 - `multi_gmail_get_thread` returns a chronological transcript (`format`, `stripped`, `latestN`)
-- `multi_gmail_send` sends an approved **reply** (`messageId` required); **`multi_gmail_send_new`** starts a **new thread** (campaigns / cold outreach)
+- `multi_gmail_send` sends an approved **reply** (`messageId` required); **`multi_gmail_send_new`** starts a **new thread** (standalone outbound mail)
 - outbound tools support **`format`**: `text/plain` (default) or `text/html` (pricing tables, CTAs)
 - legacy `mode=full` on fetch still batch-loads and auto-drafts (token-heavy — avoid for normal inbox review)
 - `multi_gmail_followup_due` refreshes the thread before showing a due follow-up
@@ -53,7 +53,7 @@ node --version
 ## Install
 
 ```bash
-git clone https://github.com/TODO/multi-gmail-mcp.git
+git clone https://github.com/yourusername/multi-gmail-mcp.git
 cd multi-gmail-mcp
 npm install
 ```
@@ -197,7 +197,7 @@ Run this once per account:
 Typical signer example:
 
 ```text
-Set signer name to Sanjay Chauhan
+Set signer name to Jane Smith
 ```
 
 ---
@@ -239,7 +239,7 @@ Present `message.text` **verbatim** to the user — do not summarize snippets or
 **Step 3 — draft and send:**
 
 - Reply in an existing thread → `multi_gmail_send` with `messageId` from fetch / `get_thread`
-- New campaign / cold email → `multi_gmail_send_new` (no `messageId`)
+- New outbound email → `multi_gmail_send_new` (no `messageId`)
 
 Optional: `mode=full` on fetch still auto-drafts every thread in one batch (legacy; can cause token overflow).
 
@@ -262,7 +262,7 @@ Show due follow-ups
 What happens:
 - due reminders are loaded
 - the thread is refreshed from Gmail first
-- if the customer already replied, the reminder is resolved automatically
+- if the recipient already replied, the reminder is resolved automatically
 - otherwise a fresh follow-up draft is shown
 
 ---
@@ -456,18 +456,18 @@ Example (plain reply):
 ```json
 {
   "messageId": "19e90840fbfd1961",
-  "to": "lead@example.com",
+  "to": "recipient@example.com",
   "subject": "Re: Pricing",
   "body": "Thanks — here is the updated quote."
 }
 ```
 
 #### `multi_gmail_send_new`
-Sends one approved **new** email. Use for campaign Email 1, cold outreach, or follow-ups in the same thread.
+Sends one approved **new** email. Use for standalone outbound mail or follow-ups in the same thread.
 
 Input:
 - `to` required
-- `threadId` optional — from a prior `send_new` response; adds this message to that Gmail thread (campaign email 2+)
+- `threadId` optional — from a prior `send_new` response; adds this message to that Gmail thread (follow-up in same thread)
 - `subject` required — Unicode (–, ü, €, etc.) is RFC 2047–encoded automatically
 - `body` required unless legacy `htmlBody` is set
 - `format` optional: `text/plain` (default) or `text/html`
@@ -479,14 +479,14 @@ Input:
 
 Response includes: `sentMessageId`, `threadId`, `isNewThread: true` — store `threadId` for phase-2 threading.
 
-Example (HTML campaign):
+Example (HTML outbound):
 
 ```json
 {
-  "to": "lead@example.com",
-  "subject": "T3Planet — pricing overview",
+  "to": "recipient@example.com",
+  "subject": "Product — pricing overview",
   "format": "text/html",
-  "body": "<h1>Hello</h1><p>See our <a href=\"https://example.com/pricing\">pricing table</a>.</p>"
+  "body": "<h1>Hello</h1><p>See the <a href=\"https://example.com/pricing\">pricing table</a>.</p>"
 }
 ```
 
@@ -627,7 +627,7 @@ Lists due follow-up reminders for the active account.
 Behavior:
 - refreshes the thread before returning results
 - includes full `threadContext`
-- skips reminders if the customer already replied
+- skips reminders if the recipient already replied
 
 Input:
 - `accountAlias` optional
@@ -722,7 +722,7 @@ Example:
 
 ```json
 {
-  "chatScope": "sales-inbox"
+  "chatScope": "work-inbox"
 }
 ```
 
@@ -864,7 +864,7 @@ This repository may also write:
 - local reminder data
 - local markdown inbox review exports
 
-Treat those as sensitive customer data.
+Treat those as sensitive personal data.
 
 ---
 
