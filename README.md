@@ -1,4 +1,4 @@
-# multi-gmail-mcp
+# @nitsantechnologies/multi-gmail-mcp
 
 Multi-account Gmail MCP server for Claude Desktop, Cursor, and other MCP hosts.
 
@@ -53,14 +53,29 @@ node --version
 ## Install
 
 ```bash
-git clone https://github.com/yourusername/multi-gmail-mcp.git
-cd multi-gmail-mcp
-npm install
+npm install -g @nitsantechnologies/multi-gmail-mcp
+mkdir -p ~/.multi-gmail-mcp
 ```
 
-Useful local commands:
+Set this env var anywhere you run the server or auth command:
 
 ```bash
+export MULTI_GMAIL_MCP_HOME="$HOME/.multi-gmail-mcp"
+```
+
+Useful commands:
+
+```bash
+multi-gmail-mcp
+multi-gmail-mcp-auth
+```
+
+Local development from git still works:
+
+```bash
+git clone https://github.com/nitsan-ai/Multi-Gmail-MCP.git
+cd Multi-Gmail-MCP
+npm install
 npm start
 npm run auth
 ```
@@ -76,11 +91,13 @@ npm run auth
 5. Create **OAuth client ID**
 6. Choose **Desktop app**
 7. Download the JSON file
-8. Save it in the project root as:
+8. Save it in your config home as:
 
 ```text
-credentials.json
+~/.multi-gmail-mcp/credentials.json
 ```
+
+Set a different location with `MULTI_GMAIL_MCP_HOME`. For local git development, project root still works by default.
 
 OAuth scopes used by this MCP:
 - `https://www.googleapis.com/auth/gmail.readonly`
@@ -91,7 +108,7 @@ OAuth scopes used by this MCP:
 **After upgrading:** re-authenticate every connected account once so tokens include `gmail.settings.basic` (required for automatic signature appending on `send`, `set_draft`, and `followup_send`):
 
 ```bash
-npm run auth -- --alias <your-alias>
+MULTI_GMAIL_MCP_HOME="$HOME/.multi-gmail-mcp" multi-gmail-mcp-auth --alias <your-alias>
 ```
 
 Then reconnect in your MCP client (`connect` + `connect_finish`).
@@ -103,17 +120,17 @@ Then reconnect in your MCP client (`connect` + `connect_finish`).
 Authenticate the first Gmail account:
 
 ```bash
-npm run auth
+MULTI_GMAIL_MCP_HOME="$HOME/.multi-gmail-mcp" multi-gmail-mcp-auth
 ```
 
 Add another account with an alias:
 
 ```bash
-npm run auth -- --alias work
+MULTI_GMAIL_MCP_HOME="$HOME/.multi-gmail-mcp" multi-gmail-mcp-auth --alias work
 ```
 
 Notes:
-- token files are saved under `accounts/`
+- token files are saved under `$MULTI_GMAIL_MCP_HOME/accounts/`
 - each alias gets its own token JSON
 - `--account` is accepted as a synonym for `--alias`
 
@@ -133,32 +150,24 @@ Example:
 {
   "mcpServers": {
     "multi-gmail-mcp": {
-      "command": "node",
+      "command": "npx",
       "args": [
-        "/absolute/path/to/multi-gmail-mcp/src/index.js"
-      ]
+        "-y",
+        "@nitsantechnologies/multi-gmail-mcp"
+      ],
+      "env": {
+        "MULTI_GMAIL_MCP_HOME": "/Users/you/.multi-gmail-mcp"
+      }
     }
   }
 }
 ```
 
-Use `pwd` inside the project root to get the absolute path.
+Replace `/Users/you/.multi-gmail-mcp` with your real path.
 
 After saving:
 - fully quit Claude Desktop
 - reopen Claude Desktop
-
-If Claude loses `PATH` after restart, use the optional launcher instead:
-
-```json
-{
-  "mcpServers": {
-    "multi-gmail-mcp": {
-      "command": "/absolute/path/to/multi-gmail-mcp/bin/run-multi-gmail-mcp.sh"
-    }
-  }
-}
-```
 
 ---
 
@@ -169,15 +178,19 @@ Open **Cursor Settings -> MCP -> Add server** and use:
 ```json
 {
   "multi-gmail-mcp": {
-    "command": "node",
+    "command": "npx",
     "args": [
-      "/absolute/path/to/multi-gmail-mcp/src/index.js"
-    ]
+      "-y",
+      "@nitsantechnologies/multi-gmail-mcp"
+    ],
+    "env": {
+      "MULTI_GMAIL_MCP_HOME": "/Users/you/.multi-gmail-mcp"
+    }
   }
 }
 ```
 
-If Cursor has the same restart/PATH problem, use the launcher script form shown above.
+Replace `/Users/you/.multi-gmail-mcp` with your real path.
 
 ---
 
@@ -732,7 +745,7 @@ This keeps one chat’s active account binding separate from another chat’s.
 
 ## Files and Data
 
-Important local paths:
+Important local paths under `$MULTI_GMAIL_MCP_HOME`:
 
 - `credentials.json`
   Google OAuth client credentials
@@ -746,20 +759,25 @@ Important local paths:
 Project layout:
 
 ```text
-multi-gmail-mcp/
+~/.multi-gmail-mcp/
 ├── credentials.json
 ├── accounts/
-├── data/
-├── bin/
-├── src/
-│   ├── mcp/           # tools + schemas
-│   ├── gmail/         # API + thread-transcript.js
-│   ├── config/        # constants, inbox-workflow.js
-│   └── utils/         # formatters, html-text, email-body-stripper, send-content
-└── README.md
+└── data/
+    ├── followup-reminders.json
+    └── inbox-reviews/
 ```
 
-**Dependencies** (for HTML bodies and quote stripping): `email-reply-parser`, `planer`, `jsdom` — installed via `npm install`.
+Useful env vars:
+
+| Name | Purpose |
+|------|---------|
+| `MULTI_GMAIL_MCP_HOME` | base directory for credentials, tokens, and local data |
+| `GOOGLE_CREDENTIALS_PATH` | absolute or config-home-relative path to OAuth credentials |
+| `ACCOUNTS_DIR` | absolute or config-home-relative path to token files |
+| `FOLLOWUP_REMINDERS_PATH` | absolute or config-home-relative reminder store path |
+| `GMAIL_REVIEW_MARKDOWN_DIR` | absolute or config-home-relative inbox export directory |
+
+**Dependencies** (for HTML bodies and quote stripping): `email-reply-parser`, `planer`, `jsdom`.
 
 ---
 
@@ -779,20 +797,10 @@ Use `multi_gmail_setup_labels` if they do not appear.
 
 ### Server not showing in Claude or Cursor
 
-- make sure the config path is absolute
+- make sure `MULTI_GMAIL_MCP_HOME` points at your real config directory
 - make sure `node --version` is `18+`
 - fully quit and reopen the app
-- if `"command": "node"` fails after restart, use the launcher script:
-
-```json
-{
-  "mcpServers": {
-    "multi-gmail-mcp": {
-      "command": "/absolute/path/to/multi-gmail-mcp/bin/run-multi-gmail-mcp.sh"
-    }
-  }
-}
-```
+- if `npx` is unavailable inside the app, install globally and use the full path to `multi-gmail-mcp`
 
 ### `multi_gmail_status` not available
 
@@ -809,8 +817,8 @@ Check:
 Re-authenticate:
 
 ```bash
-rm accounts/*.json
-npm run auth
+rm ~/.multi-gmail-mcp/accounts/*.json
+MULTI_GMAIL_MCP_HOME="$HOME/.multi-gmail-mcp" multi-gmail-mcp-auth
 ```
 
 ### Permission or scope errors
@@ -829,7 +837,7 @@ Then re-authenticate (see **Local Account Auth** above).
 - re-authenticate missing accounts:
 
 ```bash
-npm run auth -- --alias work
+MULTI_GMAIL_MCP_HOME="$HOME/.multi-gmail-mcp" multi-gmail-mcp-auth --alias work
 ```
 
 ### Labels missing in Gmail
@@ -871,3 +879,9 @@ Treat those as sensitive personal data.
 ## License
 
 MIT
+
+---
+
+## Company
+
+Developed by [NITSAN Technologies](https://nitsan.ai/ "https://nitsan.ai/")
