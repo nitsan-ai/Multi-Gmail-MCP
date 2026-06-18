@@ -1,4 +1,4 @@
-# @nitsantechnologies/multi-gmail-mcp
+multi-gmail-mcp
 
 Multi-account Gmail MCP server for Claude Desktop, Cursor, and other MCP hosts.
 
